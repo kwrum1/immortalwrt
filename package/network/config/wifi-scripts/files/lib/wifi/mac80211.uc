@@ -126,16 +126,16 @@ set ${s}.${id}
 set ${s}.band='${band_name}'
 set ${s}.channel='${channel}'
 set ${s}.htmode='${htmode}'
-set ${s}.country='${country || 'CN'}'
+set ${s}.country='CN'
 set ${s}.num_global_macaddr='${num_global_macaddr || ''}'
 
 set ${si}=wifi-iface
 set ${si}.device='${name}'
 set ${si}.network='lan'
 set ${si}.mode='ap'
-set ${si}.ssid='${defaults?.ssid || 'OWRT'}'
-set ${si}.encryption='${defaults?.encryption || 'psk2+ccmp'}'
-set ${si}.key='${defaults?.key || '12345678'}'
+set ${si}.ssid='OWRT'
+set ${si}.encryption='psk2+ccmp'
+set ${si}.key='12345678'
 set ${si}.disabled='0'
 
 `);

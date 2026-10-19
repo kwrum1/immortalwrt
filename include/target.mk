@@ -53,9 +53,8 @@ DEFAULT_PACKAGES.router:=\
 	dnsmasq-full \
 	firewall4 \
 	nftables \
-	kmod-nft-offload \
 	odhcp6c \
-	odhcpd-ipv6only \
+	odhcpd \
 	ppp \
 	ppp-mod-pppoe
 # For easy usage

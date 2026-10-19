@@ -22,7 +22,7 @@ define Package/firewall4
   CATEGORY:=Base system
   TITLE:=OpenWrt 4th gen firewall
   DEPENDS:= \
-	+kmod-nft-core +kmod-nft-fib +kmod-nft-offload \
+	+kmod-nft-core +kmod-nft-fib \
 	+kmod-nft-nat \
 	+kmod-nf-conntrack-bridge \
 	+nftables-json \

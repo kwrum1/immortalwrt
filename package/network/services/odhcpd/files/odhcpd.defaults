@@ -123,14 +123,14 @@ EOF
 
 uci batch <<EOF
 set dhcp.odhcpd=odhcpd
-set dhcp.odhcpd.maindhcp=$ODHCPDONLY
+set dhcp.odhcpd.maindhcp=1
 set dhcp.odhcpd.leasefile=/tmp/odhcpd.leases
 set dhcp.odhcpd.leasetrigger=/usr/sbin/odhcpd-update
 set dhcp.odhcpd.loglevel=4
 set dhcp.odhcpd.piodir=/tmp/odhcpd-piodir
 set dhcp.odhcpd.hostsdir=/tmp/hosts
 set dhcp.lan.dhcpv4=$V4MODE
-set dhcp.lan.dhcpv6=disabled
+set dhcp.lan.dhcpv6=$V6MODE
 set dhcp.lan.ra=$V6MODE
 set dhcp.lan.ra_slaac=1
 set dhcp.lan.max_preferred_lifetime=2700
