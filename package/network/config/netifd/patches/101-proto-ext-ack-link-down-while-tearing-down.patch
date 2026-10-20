@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mydist <mydist@local>
+Date: Tue, 20 Oct 2026 20:10:00 +0800
+Subject: [PATCH] proto-ext: acknowledge link-down while tearing down
+
+A link-down notification that arrives while the proto state machine is
+already in S_TEARDOWN/S_SETUP_ABORT has nothing left to act on: the
+interface is going away and netifd itself asked for the teardown.
+
+proto-shell builds on proto-ext, so the DHCP client script's deconfig
+path (proto_init_update "*" 0 in /lib/netifd/dhcp.script) sends exactly
+this notification when netifd SIGTERMs udhcpc after a carrier loss.
+netifd answered UBUS_STATUS_PERMISSION_DENIED, which the ubus CLI printed
+as
+
+  Command failed: ubus call network.interface notify_proto
+    { "action": 0, "link-up": false, ... } (Permission denied)
+
+on every link flap. That is not an ACL problem and the deconfig itself
+did succeed; the line only made an expected teardown look like a failure
+(measured on the lab VM: e1000 carrier bounce at 118 s, one such line,
+first lease released and reacquired 3 s later).
+
+Acknowledge a link-down in the teardown states instead. Every other
+notification keeps the old "refuse updates while tearing down" answer.
+
+Signed-off-by: mydist <mydist@local>
+---
+ proto-ext.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+--- a/proto-ext.c
++++ b/proto-ext.c
+@@ -353,8 +353,25 @@ proto_ext_update_link(struct proto_ext_state *state, struct blob_attr *data, struct blob_attr **tb)
+ 	bool keep = false;
+ 	bool up;
+ 
++	/* A link-down notification that arrives while the proto is already
++	 * being torn down is a no-op, not an error: the interface is going
++	 * away and there is nothing left to update. The DHCP client script
++	 * sends exactly this from its deconfig path when netifd SIGTERMs
++	 * udhcpc after a carrier loss; answering "Permission denied" made
++	 * ubus print
++	 *
++	 *   Command failed: ubus call ... notify_proto (...) (Permission denied)
++	 *
++	 * on every link flap and made an expected teardown look like a
++	 * failure. Acknowledge it instead; all other notifications are still
++	 * refused while the proto is tearing down.
++	 */
++	if ((state->sm == S_TEARDOWN || state->sm == S_SETUP_ABORT) &&
++	    tb[NOTIFY_LINK_UP] && !blobmsg_get_bool(tb[NOTIFY_LINK_UP]))
++		return 0;
++
+ 	if (state->sm == S_TEARDOWN || state->sm == S_SETUP_ABORT)
+ 		return UBUS_STATUS_PERMISSION_DENIED;
+ 
+ 	if (!tb[NOTIFY_LINK_UP])
+ 		return UBUS_STATUS_INVALID_ARGUMENT;
+-- 
+2.43.0
