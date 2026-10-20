@@ -51,7 +51,7 @@ CI 只对 **X86 / ROCKCHIP** 使用这个分支；IPQ / MTK 仍构建上游的 `
 | **router-acl** | 本仓库 `src/acl.bpf.c` + `aclctl.c` | WAN 侧 eBPF ACL：挡住无主入站；`bypass` 模式加 mark + `notrack`，把 NAT 流逃离 conntrack | 叠加在 fw4 之上的策略层（fw4 仍兜底） | 比 stock 更严；`mode=guard` 默认开；`import_firewall=1` 同步端口转发 |
 | **router-qos** | 本仓库，纯脚本 | WAN 上一条 `root cake`，按上行整形；`triple-isolate` 逐主机公平、`diffserv4` 分档 | 默认 `fq_codel` / 无整形 | 只做上传方向（下载需要 IFB，实测会破坏 ACL/dpd 的 hook 顺序） |
 | **router-tuning** | 本仓库，纯脚本 | 首启按 CPU/内存/网卡选档：BBR、`fq`、sysctl、ring/coalescing、XPS、governor | 不替换 qdisc；只调内核与网卡参数 | 所有写入都在**运行期**，不动 `/etc/config/{network,dhcp,firewall}` |
-| **router-dns** | 本仓库，纯脚本 | **SmartDNS 独占 :53**；dnsmasq 端口 0 并停用；DoT 上游（223.5.5.5 → dns.alidns.com，119.29.29.29 → dot.pub）；honk 的 DNS 交接 | 替换 dnsmasq 的解析角色 | dnsmasq 只保留二进制，不再监听；`/etc/hosts` 等本地名字由 SmartDNS 的本地域处理 |
+| **router-dns** | 本仓库，纯脚本 | **SmartDNS 独占 :53**；dnsmasq 端口 0 并停用；`router-dns-sync` 把 DHCP 学到的真实上游（非本机）写成 `server` 段，DoT 作为并行上游；`/tmp/resolv.conf` → `127.0.0.1`；`.lan` 名字写进 `hosts.lan`；honk 的 DNS 交接 | 替换 dnsmasq 的解析角色 | dnsmasq 只保留二进制，不再监听；上游**从租约派生**而不是写死，自身地址一律过滤 |
 | **luci-front** | 本仓库；Rust + pingora 0.9，静态 musl，预编译（x86_64 / aarch64） | :80/:443：HTTP/2、TLS、HSTS/CSP/X-Frame-Options/X-Content-Type-Options、静态 ETag/304；`/cgi-bin`、`/ubus` 反代 uhttpd | 替换 uhttpd 的对外监听 | uhttpd 退到 `127.0.0.1:8080`，只保留 Lua CGI 与 ubus 桥 |
 | **luci-app-mydist** | 本仓库 | 菜单（DNS/代理/防火墙/QoS）、五元组端口控制（单行表格）、QoS 页、`mydist-posture` | 替换原版 firewall/smartdns/honk 菜单入口 | `rule 999` 默认开启且不在 UI 显示；保存端口行时自动补 `src=wan/dest=lan/target=DNAT` 并丢弃未填完的行 |
 
@@ -126,6 +126,22 @@ make -j$(nproc)
 | x86 镜像 | 含 i915/DRM | 去掉 i915/video-support |
 
 ---
+
+## 6.1 第 10 轮修复（2026-10-20，`3350e33`）
+
+测试专家在真机上发现并已修复：
+
+| 问题 | 修复 |
+|---|---|
+| **WAN 拿到路由器自己发的 DHCP 租约**，默认路由指向本机 → 整机无外网 | `mydist-posture` 把本机各接口 MAC 注册成 `dhcp.mydist_self_<iface>``（`option ip 'ignore'`），odhcpd 不再给本机发租约；实测重启后默认路由为真实网关 |
+| **SmartDNS 只有两条被封的 DoT 上游**，所有解析失败 | 新增 `/usr/libexec/router-dns-sync`：从 netifd/ubus 与 `resolv.conf.auto` 派生真实上游（本机地址全部过滤），写成显式 `config server` 段；DoT 保留为并行上游；`ifup/ifupdate` 触发 |
+| **`/etc/resolv.conf` 指向网关/自己**，路由器自身解析失败 | `/tmp/resolv.conf` 改写为 `nameserver 127.0.0.1` + `search lan`，`/etc/resolv.conf` 用 overlay 文件覆盖；每次 ifup 重写 |
+| **`.lan` 主机名不可解析**（dnsmasq 已停用） | 生成 `/var/etc/router-dns/hosts.lan`（本机名 + odhcpd 租约名，含 `.lan` 形式），smartdns `hosts-file` 读取 |
+| **honk 的 DNS 上游仍指向 6053** | `honk-dns.sh` 与 honk `mydist` 分支统一为 `udp://127.0.0.1:53` |
+| **lab 配置的 `lan.gateway`/`lan.dns` 污染默认路由与 resolv.conf** | `lab-99-test-lab` 删除这两项，跨网段访问只依赖 `network.myadmin` 回程路由 |
+| **`accept-full.sh` 的 DNS 断言是假 PASS** | 改为 `grep '^Name:'` + 退出码，并新增“外部客户端查询”“默认网关不是本机地址”断言（现为 62 项） |
+
+回归结果：`accept-full.sh` **62 PASS / 0 FAIL / 1 SKIP**；本机与外部客户端 DNS 均通；重启后姿态保持。
 
 ## 7. 已知限制
 
