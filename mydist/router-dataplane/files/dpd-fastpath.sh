@@ -297,18 +297,38 @@ dpd_gate_refresh_uci() {
 	printf '%s' "$emode"
 }
 
-# Enforce "the uplink is never attached" (see the note in 90-dpd-fastpath).
+# Enforce "the uplink is never attached" unless `option downlink '1'`.
 #
 # Called from the init script at start and from every gate refresh, so a stale
 # attachment cannot outlive a mode change. Teaching its L2 flags is safe and
 # necessary: redirect=auto needs them to pick the right emit path for the device
 # every LAN->WAN flow leaves through.
+#
+# With downlink=1 the uplink *is* attached, on purpose: that is the return
+# direction (WAN->LAN) accelerator. It is opt-in because it hooks the device
+# whose inbound policy belongs to router-acl and fw4 (see the note below), and
+# because it is only safe in stateful mode: the first packet of every flow still
+# traverses netfilter and builds conntrack/NAT state, and only then does the
+# program start taking the rest of that flow over. Measured on the lab bench
+# (2026-10-27, 2 vCPU x86_64, -P4 iperf3 download): 2.72 -> 3.44 Gbit/s, router
+# CPU 61% -> 65% (total), and the L2 emit path another +16% on top of that.
 dpd_reconcile_uplink() {
-	local w d n=0
+	local w d n=0 downlink=0
+
+	config_load dpd_fastpath
+	config_get_bool downlink global downlink 0
 
 	for w in wan wan6 wan_6; do
 		d="$(dpd_resolve_logical "$w")"
 		[ -n "$d" ] || continue
+		if [ "$downlink" = 1 ]; then
+			# attached on purpose; the chain guard decides whether the
+			# policy layer is behind us on that device too
+			dpd_attach_if "$d" || continue
+			dpd_chain_guard "$d" || dpd_log "chain guard: a bpf filter sits after us on uplink $d"
+			n=$((n + 1))
+			continue
+		fi
 		if dpd_is_attached "$d"; then
 			dpd_detach_if "$d"
 			dpd_log "invariant: detached $d (the uplink is never attached)"
@@ -316,6 +336,7 @@ dpd_reconcile_uplink() {
 		fi
 		dpd_teach_iface "$d"
 	done
+	[ "$downlink" = 1 ] && dpd_log "downlink=1: uplink ingress accelerated for learned flows ($n device(s))"
 	[ "$n" = 0 ] || dpd_log "invariant: removed $n stale uplink attachment(s)"
 	return 0
 }

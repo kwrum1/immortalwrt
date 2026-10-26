@@ -32,6 +32,7 @@ dpd_uci() {
 	config_get DPD_IFACES global interfaces 'lan'
 	config_get DPD_POLICY global policy 'allow_all'
 	config_get DPD_VLANS global vlans ''
+	config_get_bool DPD_DOWNLINK global downlink 0
 	# The configured mode is only a request; the gates may lower it. Evaluated
 	# per event, exactly like the init script does, so a hotplug cannot undo a
 	# downgrade.
@@ -71,20 +72,32 @@ ifup|ifupdate|add|update)
 	[ "$attach" = "1" ] || exit 0
 	[ -n "$DEVICE" ] || exit 0
 
-	# The uplink is NEVER attached: taking a packet over on the WAN would skip
-	# router-acl's nft guard and the input path for router-destined packets, so
-	# acceleration is LAN-side only. (The older code attached it for "telemetry"
-	# while the effective mode was observe and then left the filter behind when
-	# einat came up and the gate moved to stateless -- i.e. it silently started
-	# accelerating inbound, exactly what the rule forbids. Removed 2026-10-18.)
+	# The uplink is attached only when `option downlink '1'`: taking a packet
+	# over on the WAN skips router-acl's nft guard and the input path for
+	# router-destined packets, so the default is to leave it alone. (The older
+	# code attached it for "telemetry" while the effective mode was observe and
+	# then left the filter behind when einat came up and the gate moved to
+	# stateless -- i.e. it silently started accelerating inbound, exactly what
+	# the rule forbids. Removed 2026-10-18.)
 	#
-	# It still has to be *taught*, though: the emitting device for every LAN->WAN
+	# It always has to be *taught*, though: the emitting device for every LAN->WAN
 	# flow is the uplink, and `redirect auto` can only choose bpf_redirect()
 	# over bpf_redirect_neigh() if it knows that device's L2 capabilities
 	# (IFF_NOARP | IFF_POINTOPOINT for ppp). Teaching writes one entry into
 	# dpd_iface and installs nothing.
 	if dpd_is_wan_device "$DEVICE"; then
 		dpd_teach_iface "$DEVICE"
+		if [ "$DPD_DOWNLINK" = 1 ]; then
+			if dpd_attach_if "$DEVICE"; then
+				dpd_push_config
+				dpd_mode_wants_accel "$DPD_EMODE" && ! dpd_chain_guard "$DEVICE" &&
+					dpd_log "chain guard: a bpf filter sits after us on uplink $DEVICE"
+				dpd_log "hotplug $ACTION $INTERFACE -> $DEVICE downlink attached (effective mode $DPD_EMODE)"
+			else
+				dpd_log "hotplug $ACTION $INTERFACE -> $DEVICE downlink attach deferred"
+			fi
+			exit 0
+		fi
 		dpd_log "hotplug $ACTION $INTERFACE -> $DEVICE is the uplink: L2 flags taught, never attached"
 		exit 0
 	fi

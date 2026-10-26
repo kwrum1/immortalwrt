@@ -188,6 +188,29 @@ VLAN 列表每次启动都**从 uci 重建**（先 `vlan flush`），不会留�
 `auto` 的退化路径是**刻意的**：`bpf_redirect_neigh()` 需要邻居子系统解析下一跳，
 而 ppp 口没有 ARP，理论上不适用。
 
+### 2.5 回程方向（`option downlink`）
+
+默认 **关**。打开后初始化脚本会把**同一个对象**也挂到上行口（`wan`/`wan6` 解析出的
+设备）的 ingress 钩子，于是 WAN→LAN 方向已学到的流也能直接重定向回 LAN，不再走
+netfilter。实测收益明确（§5），默认关掉仍是对的，理由三条：
+
+1. **它钩的是"别人的"设备。** 上行口的入向策略属于 router-acl + fw4（本共享库里的
+   "上行口永不挂载"不变式）。那条不变式是**安全边界**而不是性能取舍，所以这个选项
+   必须是显式 opt-in。
+2. **只在 `stateful` 下成立。** 每条流的首包仍然走完整栈（conntrack、fw4、einat 在
+   WAN TCX 上的 rev-SNAT —— TCX 在我们之前），所以"发往路由器自己的包"和"新建入站
+   连接"仍由栈裁决，只有**已转发过的、活着的流**的后续包被接管。
+   `mode=stateless` + `downlink=1` 会让每个 WAN→LAN 转发包立刻被接管，**不要这样配**。
+3. **顺序仍然安全。** einat 的 rev-SNAT 是 TCX，跑在 classic 链之前，所以我们看到的
+   是**已经翻译过**的包（目的地址已是 192.168.x.x）。`dpd_chain_guard()` 仍会检查这条
+   钩子上有没有 classic bpf 过滤器排在我们后面（router-acl 是 pref 90，在前），有就
+   在日志里点名。
+
+热插拔（`90-dpd-fastpath`）在 `downlink=1` 时也会在 pppoe 重拨后补挂，否则新设备
+出现后回程会悄悄失去加速。最小改动只有两处：`dpd_reconcile_uplink()` 在
+`downlink=1` 时改成"挂载 + 链检查"，否则保持原来的"强制卸载"；热插拔的上行口分支
+同理。
+
 
 **实测结论（2026-10-17，x86_64 QEMU，`build/qemu-dpd-diag.sh`）**：以太网 WAN 上
 `bpf_redirect_neigh(ifindex, NULL, 0, 0)` 的 NULL-params 路径**确实能用** —— 出厂
@@ -294,6 +317,9 @@ strings -a dpd_fastpath.bpf.o | grep -E '^dpd_' | sort -u
 | 项 | 证据 |
 |---|---|
 | FIB 判定可用 | `fib_ok` 随流量增长，`fib_fail` 只在本地目的上出现 |
+| **L2 直发（ABI 6）真的在用** | `redirect auto` 下 10 秒 iperf3：`redirect_ok +243872`、`neigh_ok +0`、`fib_ok +243872`（即每个包都走了"自己拼 L2 头 + `bpf_redirect`"，没有一次 `redirect_neigh`）；同一窗口客户端 `ping` 0% loss、吞吐 4.8 Gbit/s。`dpd_flows` 的原始值里 `smac` 等于出口设备 `dev_addr`（eth1 `00:50:56:3f:c3:02`），`dmac` 等于下一跳 `ip neigh` 里的 lladdr |
+| **L2 直发的收益** | 同一实验台背靠背 A/B（n=5，中位数）：`auto` 4611 vs `neigh` 4680 Mbit/s（上行吞吐已在 VM 天花板，分辨不出来）；改用**固定发流**（UDP 900 Mbit/s / 260 B，两边同负载）后 CPU 24%/44% vs 27%/47%（总/最忙核，中位数 n=5），即每包成本降了约 10% |
+| **回程钩子 + L2 的收益** | 下载方向（`stateful`，iperf3 -P4 -R，n=3 中位数）：只挂 br-lan 2.72 Gbit/s → 再挂 eth1 `auto` **3.44 Gbit/s**（+26%），同条件 `neigh` 2.98 Gbit/s（L2 直发再贡献 +16%）；CPU 61%→65%/75%（总/核）|
 | **加速真的把包送到对端**（ICMP 端到端） | 出厂态 `stateless` 下，LAN 客户端 `ping 10.0.2.2`（WAN 直连邻居）**2/2 0% loss**；`ping 8.8.8.8`（经网关）**2/2 0% loss**；同期 eth1 `tx_dropped` 0 → 0 |
 | 与 honk 共存 | honk 的 TCX 生效期间 dpd 计数仍在涨（`pkt_total` 持续 +），且 honk 仍然代理成功（§4.11） |
 | 观察模式零风险 | `mode=observe` 时 `redirect_ok 0`，流量不受影响 |
