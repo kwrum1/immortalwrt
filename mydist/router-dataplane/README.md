@@ -190,26 +190,65 @@ VLAN 列表每次启动都**从 uci 重建**（先 `vlan flush`），不会留�
 
 ### 2.5 回程方向（`option downlink`）
 
-默认 **关**。打开后初始化脚本会把**同一个对象**也挂到上行口（`wan`/`wan6` 解析出的
-设备）的 ingress 钩子，于是 WAN→LAN 方向已学到的流也能直接重定向回 LAN，不再走
-netfilter。实测收益明确（§5），默认关掉仍是对的，理由三条：
+**2026-10-27 起默认开**，但只对 `mode=stateful` 生效（其他模式下初始化脚本和热插拔都会
+把它当 `0` 并写日志）。打开后初始化脚本会把**同一个对象**也挂到上行口（`wan`/`wan6`
+解析出的设备）的 ingress 钩子，于是 WAN→LAN 方向已学到的流也能直接重定向回 LAN，不再
+走 netfilter。
 
-1. **它钩的是"别人的"设备。** 上行口的入向策略属于 router-acl + fw4（本共享库里的
-   "上行口永不挂载"不变式）。那条不变式是**安全边界**而不是性能取舍，所以这个选项
-   必须是显式 opt-in。
-2. **只在 `stateful` 下成立。** 每条流的首包仍然走完整栈（conntrack、fw4、einat 在
-   WAN TCX 上的 rev-SNAT —— TCX 在我们之前），所以"发往路由器自己的包"和"新建入站
-   连接"仍由栈裁决，只有**已转发过的、活着的流**的后续包被接管。
-   `mode=stateless` + `downlink=1` 会让每个 WAN→LAN 转发包立刻被接管，**不要这样配**。
-3. **顺序仍然安全。** einat 的 rev-SNAT 是 TCX，跑在 classic 链之前，所以我们看到的
-   是**已经翻译过**的包（目的地址已是 192.168.x.x）。`dpd_chain_guard()` 仍会检查这条
-   钩子上有没有 classic bpf 过滤器排在我们后面（router-acl 是 pref 90，在前），有就
-   在日志里点名。
+实测（§5，n=3 交错）：下载 2931 → 3410 Mbit/s（+16%，CPU 64%→66%），上传 4921 →
+5233 Mbit/s（+6%，对端的 ACK 流也被接管）；9 秒下载里 netfilter forward 钩子从
+148302 个 skb 降到 6 个。
+
+#### 为什么可以默认开（三条实测事实，不是推断）
+
+1. **"新建入站连接"根本轮不到我们。** einat 的 `ingress_rev_snat` 是 TCX，跑在
+   netfilter 之前；它没有映射的 WAN→LAN 包在 **prerouting 之前就被丢掉**。实测
+   （2026-10-27）：einat 挂着时，从 WAN 侧向 LAN 主机发 SYN，`prerouting priority
+   -350` 的探针计数为 0，连接超时；把 einat 停掉，同一个 SYN 立刻被转发（对端回 RST）。
+   所以这条钩子**只可能看到 einat 已经 SNAT 过的那条流的回程**，不存在"WAN 上的陌生
+   包被 dpd 直接塞进 LAN"的路径。（顺带说明：带 einat 的盒子上，fw4 的端口转发 /
+   DNAT 本来就不工作，与 dpd 无关。）
+2. **发往路由器自己的包不受影响。** 转发钩子只在目的地址要经 br-lan 出去时命中；
+   `bpf_fib_lookup` 对本地地址返回的区域被 `fib.ifindex == skb->ifindex` 挡住。
+3. **快路径中断不会断流。** 实测：34 秒下载，第 10 秒 `dpdctl set mode off`（等价于
+   重启/看门狗接管），下载继续完成（11 次重传，无停顿）。原因是 einat 在 netfilter
+   之前就改好地址，而 fw4 里 einat 注入的 WAN→LAN 全量 accept 还在。
+
+#### 风险边界（哪些东西看不到被接管的回程包）
+
+被接管的包在 eth1 ingress 的 classic 链之后直接 `bpf_redirect()` 到 br-lan，因此它们
+**不经过**：
+
+* `nf_conntrack` 的记账和状态机（`/proc/net/netfilter/nf_conntrack` 里那条流的
+  `packets/bytes` 不再增长；`nf_conntrack_count` 不会因为大流量增长，这是好事）；
+* fw4 的 `forward` 链：包括 `ct state` 之外的**用户规则**、`mangle_forward`（MSS
+  clamp，但只对 SYN 生效，而 SYN 是首包，仍会走栈）、以及 fw4 的每 zone 计数器；
+* 任何 nft 的 `limit` / 每流 `counter` / 动态黑名单：它们只看到一条流的头几个包。
+
+**仍然能看到**：einat 的 TCX（NAT）、router-acl（pref 90，在我们之前）、桥/邻居层。
+所以 ACL 和 NAT 语义不变，丢的是"逐包记账/逐包限速"。
+
+需要逐包统计下载方向（例如用 nft counter 做流量配额、或按流限速）的盒子，把
+`option downlink '0'` 关掉 —— 这是该选项唯一的取舍。
+
+#### conntrack 与 `flow_ttl_ms` 的关系（ABI 7 的 priming）
+
+`flow_ttl_ms`（默认 5000）只管**我们自己**的流表新鲜度，与 conntrack 超时无关。ABI 7
+之前有一个真实窗口：stateful 模式在**第二个**包就开始接管，于是 TCP 三步握手的最后一个
+ACK 也被接管，conntrack 永远停在 `SYN_RECV`（实测一条 12.4 GB 的下载在表里就是
+`packets=1 bytes=60`），并在 120 秒的 `syn_recv` 超时后**在流还活着的时候被删掉**。
+
+ABI 7 起每个方向先"喂" `DPD_FLOW_PRIME`（1）个包给栈，即一条流的前两个包（SYN、
+ACK）仍然过 netfilter：握手完成、条目进入 `ESTABLISHED`（超时 7440 秒），
+`nf_conntrack_count`、`ct state` 规则、以及"快路径停掉后回退到慢路径"都保持有意义。
+代价是每条流两个包，不改变 value 布局（计数器放在 `dpd_flow_val.flags` 的高字节）。
+
+UDP 没有握手，`nf_conntrack_udp_timeout_stream`（180 秒）在加速流上不会被子刷新，
+条目会过期；这对转发无影响（见上面第 3 点），但意味着 UDP 的 conntrack 记账必然失真。
 
 热插拔（`90-dpd-fastpath`）在 `downlink=1` 时也会在 pppoe 重拨后补挂，否则新设备
-出现后回程会悄悄失去加速。最小改动只有两处：`dpd_reconcile_uplink()` 在
-`downlink=1` 时改成"挂载 + 链检查"，否则保持原来的"强制卸载"；热插拔的上行口分支
-同理。
+出现后回程会悄悄失去加速。`dpd_reconcile_uplink()` 在 `downlink=1` 时是"挂载 + 链
+检查"，否则保持原来的"强制卸载"；`dpd_wait_for_dev()` 里晚到的上行口也走同一个决定。
 
 
 **实测结论（2026-10-17，x86_64 QEMU，`build/qemu-dpd-diag.sh`）**：以太网 WAN 上

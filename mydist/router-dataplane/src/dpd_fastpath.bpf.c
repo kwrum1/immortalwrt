@@ -625,6 +625,41 @@ int dpd_fastpath(struct __sk_buff *skb)
 		age = fval ? (__s32)(now - fval->last_seen_ms) : 0;
 		if (fval && fval->egress_ifindex && age >= 0 && age < (__s32)ttl) {
 			__u32 egress = fval->egress_ifindex;
+			__u32 primed = (fval->flags & DPD_FLOW_PRIME_MASK) >>
+				       DPD_FLOW_PRIME_SHIFT;
+
+			/*
+			 * Prime the direction: the entry is usable, but the
+			 * first DPD_FLOW_PRIME hits are handed to the stack
+			 * instead of being redirected.
+			 *
+			 * Why this is not just politeness: taking over the
+			 * second packet of a TCP flow means netfilter never
+			 * sees the final ACK, so the conntrack entry stays in
+			 * SYN_RECV and expires on the 120 s syn_recv timer
+			 * while a bulk flow is still running (measured
+			 * 2026-10-27: a 12.4 GB download left packets=1
+			 * bytes=60 in the table). Letting one more packet per
+			 * direction through completes the handshake, so the
+			 * entry is ESTABLISHED, `ct state` rules and
+			 * nf_conntrack_count stay meaningful, and a flow that
+			 * later falls back to the slow path is still known.
+			 *
+			 * Cost: two packets per flow (the SYN and the ACK).
+			 * A flow shorter than that is never accelerated, which
+			 * is the conservative side.
+			 */
+			if (primed < DPD_FLOW_PRIME) {
+				fval->flags = (fval->flags & ~DPD_FLOW_PRIME_MASK) |
+					      ((primed + 1) << DPD_FLOW_PRIME_SHIFT);
+				fval->last_seen_ms = now;
+				/* not counted as a hit: ST_FLOW_HIT keeps
+				 * meaning "packets this program took over".
+				 * No new index either -- dpd_stats is a pinned
+				 * map and growing ST__MAX would break in-place
+				 * object upgrades. */
+				return TC_ACT_UNSPEC;
+			}
 
 			stat_add(ST_FLOW_HIT, 1);
 			fval->last_seen_ms = now;

@@ -313,10 +313,12 @@ dpd_gate_refresh_uci() {
 # (2026-10-27, 2 vCPU x86_64, -P4 iperf3 download): 2.72 -> 3.44 Gbit/s, router
 # CPU 61% -> 65% (total), and the L2 emit path another +16% on top of that.
 dpd_reconcile_uplink() {
-	local w d n=0 downlink=0
+	local w d n=0 downlink=0 mode=""
 
 	config_load dpd_fastpath
-	config_get_bool downlink global downlink 0
+	config_get_bool downlink global downlink 1
+	config_get mode global mode off
+	dpd_downlink_wanted "$mode" "$downlink" || downlink=0
 
 	for w in wan wan6 wan_6; do
 		d="$(dpd_resolve_logical "$w")"
@@ -357,7 +359,14 @@ dpd_wait_for_dev() {
 		[ -e "/sys/class/net/$dev" ] || continue
 		if dpd_is_wan_device "$dev"; then
 			dpd_teach_iface "$dev"
-			dpd_log "late: $dev is the uplink; L2 flags taught, not attached"
+			# With downlink=1 the uplink *is* wanted; the decision (and
+			# the mode=stateful condition) lives in one place.
+			dpd_reconcile_uplink
+			if dpd_is_attached "$dev"; then
+				dpd_log "late: $dev is the uplink; L2 flags taught, attached for downlink"
+			else
+				dpd_log "late: $dev is the uplink; L2 flags taught, not attached"
+			fi
 			return 0
 		fi
 		emode="$(dpd_gate_refresh_uci)"
@@ -365,6 +374,28 @@ dpd_wait_for_dev() {
 		return 0
 	done
 	dpd_log "gave up waiting for $dev (${tries}x${iv}s)"
+	return 1
+}
+
+# Is the return direction allowed to be accelerated?
+#
+# Two conditions, and neither is negotiable:
+#   * `option downlink '1'`, and
+#   * `option mode 'stateful'`.
+#
+# In stateless mode the *first* WAN->LAN packet of a flow would be taken over as
+# well, i.e. the return direction would never create a conntrack entry at all
+# and no fw4 forward rule would ever see the flow -- not even its first packet.
+# That is not a trade this box gets to make, so downlink is silently (but
+# loudly logged) ignored outside stateful mode.
+dpd_downlink_wanted() {
+	local mode="$1" downlink="$2"
+
+	[ "$downlink" = 1 ] || return 1
+	case "$mode" in
+	stateful) return 0 ;;
+	esac
+	dpd_log "downlink=1 ignored: the return direction is only accelerated with mode=stateful (configured mode is '$mode')"
 	return 1
 }
 

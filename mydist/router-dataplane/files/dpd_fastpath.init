@@ -78,8 +78,9 @@ start_service() {
 		fi
 		# accel is LAN-side only: taking a packet over on the WAN would skip
 		# router-acl's nft guard and the input path for router-destined traffic
+		# `option downlink '1'` is the one exception, decided below
 		if dpd_mode_wants_accel "$emode" && dpd_is_wan_device "$dev"; then
-			dpd_log "gate: '$i' ($dev) is the uplink; not accelerating inbound"
+			dpd_log "note: '$i' ($dev) is the uplink; LAN hook attached below, uplink only if downlink=1"
 			continue
 		fi
 		if dpd_attach_if "$dev"; then

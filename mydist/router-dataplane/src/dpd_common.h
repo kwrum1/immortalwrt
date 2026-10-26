@@ -76,8 +76,18 @@
  *    millisecond timestamp, so the redirect can be a plain bpf_redirect()
  *    instead of bpf_redirect_neigh() -- the latter re-runs the route lookup and
  *    the neighbour lookup for every packet. The value stays 24 bytes, so an
- *    object upgrade can reuse the pinned map (see dpd_flow_val). */
-#define DPD_ABI_VERSION		6
+ *    object upgrade can reuse the pinned map (see dpd_flow_val).
+ * 7: stateful mode *primes* each direction before it starts redirecting: the
+ *    first DPD_FLOW_PRIME+1 packets of a learned flow still traverse netfilter.
+ *    Without it a TCP flow's handshake never completes as far as conntrack is
+ *    concerned, because the client's final ACK is already taken over: the entry
+ *    sticks in SYN_RECV (measured 2026-10-27: packets=1 bytes=60 for a 12.4 GB
+ *    download) and dies on the 120 s syn_recv timer while the flow is still
+ *    running. Priming costs two packets per flow, makes the entry reach
+ *    ESTABLISHED, and keeps nf_conntrack_count / `ct state` rules / the
+ *    transition back to the slow path meaningful. No value-layout change: the
+ *    counter lives in the spare high byte of dpd_flow_val.flags. */
+#define DPD_ABI_VERSION		7
 
 /* name of the TC section in the BPF object; dpdctl/init pass this to tc(8) */
 #define DPD_BPF_SECTION		"classifier"
@@ -195,6 +205,16 @@ enum dpd_stat_idx {
  * padding, so the structure layout is unchanged. */
 #define DPD_FLOW_F_NO_NEIGH	0x0001
 
+/* dpd_flow_val.flags bits 8..15: how many packets of this direction have been
+ * let through netfilter since the entry was learned (saturating). A hit is only
+ * redirected once the counter reaches DPD_FLOW_PRIME, so the first
+ * DPD_FLOW_PRIME+1 packets of each direction walk the stack -- which is what
+ * lets conntrack see a whole TCP handshake (SYN, SYN-ACK, ACK) instead of
+ * stopping at SYN_RECV. See DPD_ABI_VERSION 7. */
+#define DPD_FLOW_PRIME_SHIFT	8
+#define DPD_FLOW_PRIME_MASK	0xff00
+#define DPD_FLOW_PRIME		1	/* extra packets per direction	*/
+
 /*
  * Mode B flow key. Kept at a fixed 48 bytes to keep the LRU hash cheap.
  * IPv4 addresses are stored right-aligned into the 16-byte v6 slots.
@@ -225,13 +245,16 @@ struct dpd_flow_key {
  * freshness test is done on the *signed difference* (age >= 0 && age < ttl),
  * never on an absolute comparison. That buys us 4 bytes for smac without growing
  * the entry.
- */
+ *
+ * flags carries DPD_FLOW_F_NO_NEIGH in bit 0 and the per-direction prime
+ * counter in bits 8..15 (DPD_FLOW_PRIME_*). The counter is the reason a
+ * redirect does not start on the first hit; see the ABI 7 note above. */
 struct dpd_flow_val {
 	__u32	egress_ifindex;
 	__u32	last_seen_ms;	/* bpf_ktime_get_ns()/1e6, wraps	*/
 	__u8	dmac[6];	/* next hop MAC from the FIB lookup	*/
 	__u8	smac[6];	/* egress dev_addr from the FIB lookup	*/
-	__u16	flags;		/* DPD_FLOW_F_*				*/
+	__u16	flags;		/* DPD_FLOW_F_* | prime counter		*/
 };
 
 #endif /* __DPD_COMMON_H */
