@@ -735,29 +735,37 @@ int dpd_fastpath(struct __sk_buff *skb)
 
 			if (fval->wan) {
 				__u32 wi = fval->wan - 1;
-				struct dpd_wan *w = bpf_map_lookup_elem(&dpd_wans, &wi);
 
-				/* an uplink that went away or was disabled makes
-				 * the entry stale: fall through and re-learn */
-				if (w && w->ifindex == egress &&
-				    (w->flags & DPD_WAN_F_UP)) {
-					stat_add(ST_FLOW_HIT, 1);
-					fval->last_seen_ms = now;
-					if (fkey.family == AF_INET)
-						ret = dpd_dec_ttl_v4(skb, data, data_end, l3_off);
-					else
-						ret = dpd_dec_hop_v6(data, data_end, l3_off);
-					if (ret > 0) {
-						stat_add(ST_TTL_DROP, 1);
-						return TC_ACT_SHOT;
-					}
-					if (ret < 0)
+				/* bound the key for the verifier: `wan` comes
+				 * out of a map value and is otherwise an
+				 * unbounded scalar */
+				if (wi < DPD_WAN_MAX) {
+					struct dpd_wan *w =
+						bpf_map_lookup_elem(&dpd_wans, &wi);
+
+					/* an uplink that went away or was disabled
+					 * makes the entry stale: fall through and
+					 * re-learn */
+					if (w && w->ifindex == egress &&
+					    (w->flags & DPD_WAN_F_UP)) {
+						stat_add(ST_FLOW_HIT, 1);
+						fval->last_seen_ms = now;
+						if (fkey.family == AF_INET)
+							ret = dpd_dec_ttl_v4(skb, data, data_end, l3_off);
+						else
+							ret = dpd_dec_hop_v6(data, data_end, l3_off);
+						if (ret > 0) {
+							stat_add(ST_TTL_DROP, 1);
+							return TC_ACT_SHOT;
+						}
+						if (ret < 0)
+							return TC_ACT_UNSPEC;
+						ret = dpd_emit_l2(skb, egress, w->gw_mac,
+								  w->dev_mac);
+						if (ret == TC_ACT_REDIRECT)
+							return ret;
 						return TC_ACT_UNSPEC;
-					ret = dpd_emit_l2(skb, egress, w->gw_mac,
-							  w->dev_mac);
-					if (ret == TC_ACT_REDIRECT)
-						return ret;
-					return TC_ACT_UNSPEC;
+					}
 				}
 			}
 
@@ -855,8 +863,8 @@ int dpd_fastpath(struct __sk_buff *skb)
 		if (!dpd_is_uplink(skb->ifindex)) {
 			int wi = dpd_pick_wan(&fkey);
 
-			if (wi >= 0) {
-				__u32 k2 = wi;
+			if (wi >= 0 && wi < DPD_WAN_MAX) {
+				__u32 k2 = (__u32)wi;
 				struct dpd_wan *w = bpf_map_lookup_elem(&dpd_wans, &k2);
 
 				if (w && w->ifindex) {
