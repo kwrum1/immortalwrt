@@ -87,7 +87,7 @@
  *    ESTABLISHED, and keeps nf_conntrack_count / `ct state` rules / the
  *    transition back to the slow path meaningful. No value-layout change: the
  *    counter lives in the spare high byte of dpd_flow_val.flags. */
-#define DPD_ABI_VERSION		7
+#define DPD_ABI_VERSION		8
 
 /* name of the TC section in the BPF object; dpdctl/init pass this to tc(8) */
 #define DPD_BPF_SECTION		"classifier"
@@ -255,6 +255,31 @@ struct dpd_flow_val {
 	__u8	dmac[6];	/* next hop MAC from the FIB lookup	*/
 	__u8	smac[6];	/* egress dev_addr from the FIB lookup	*/
 	__u16	flags;		/* DPD_FLOW_F_* | prime counter		*/
+	__u16	wan;		/* 1-based index into dpd_wans, 0 = none */
+};
+
+/* ------------------------------------------------------------------ multi-WAN
+ *
+ * One entry per uplink. The userspace daemon owns the table: it fills in the
+ * device index, the fwmark that routes the *first* packet of a flow into that
+ * uplink's table, the weight, the health flag and the two MAC addresses the
+ * egress needs (gateway and device).
+ *
+ * The fast path never does a second FIB lookup: it hashes the 5-tuple, picks a
+ * WAN with weighted rendezvous hashing, hands the first packet to the stack
+ * with skb->mark set, and caches the egress + MACs for the rest of the flow.
+ * Empty table (max_entries all zero) = the pre-multi-WAN behaviour.
+ */
+#define DPD_WAN_MAX	8
+#define DPD_WAN_F_UP	0x1
+
+struct dpd_wan {
+	__u32	ifindex;
+	__u32	mark;		/* fwmark for the slow path of new flows */
+	__u32	weight;		/* 0 disables the entry			*/
+	__u32	flags;		/* DPD_WAN_F_*				*/
+	__u8	gw_mac[6];	/* next hop on this uplink		*/
+	__u8	dev_mac[6];	/* the uplink device's own address	*/
 };
 
 #endif /* __DPD_COMMON_H */

@@ -114,6 +114,15 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } dpd_vlans SEC(".maps");
 
+/* multi-WAN uplinks; owned by the userspace daemon (see dpd_common.h) */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, DPD_WAN_MAX);
+	__type(key, __u32);
+	__type(value, struct dpd_wan);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} dpd_wans SEC(".maps");
+
 /* ------------------------------------------------------------------ helpers */
 
 static __always_inline void stat_add(__u32 idx, __u64 v)
@@ -327,6 +336,69 @@ static __always_inline int dpd_may_accelerate(const struct dpd_config *cfg,
 		return 0;
 	}
 	return dpd_policy_ok(cfg, vlan_id, tagged);
+}
+
+/* ------------------------------------------------------------- multi-WAN */
+
+/* FNV-1a over the parts of the 5-tuple that identify the flow. Salted per WAN
+ * by the caller so the rendezvous scores are independent. */
+static __always_inline __u32 dpd_flow_hash(const struct dpd_flow_key *k,
+					   __u32 salt)
+{
+	__u32 h = 2166136261u ^ salt;
+
+	h = (h ^ k->saddr[3]) * 16777619u;
+	h = (h ^ k->daddr[3]) * 16777619u;
+	h = (h ^ (((__u32)bpf_ntohs(k->sport) << 16) |
+		  bpf_ntohs(k->dport))) * 16777619u;
+	h = (h ^ ((__u32)k->proto << 8 | k->family)) * 16777619u;
+	h ^= h >> 16;
+	return h;
+}
+
+/* Is this ingress device one of the uplinks? (downlink hook traffic must not be
+ * re-hashed back out another uplink). */
+static __always_inline int dpd_is_uplink(__u32 ifindex)
+{
+	#pragma unroll
+	for (__u32 i = 0; i < DPD_WAN_MAX; i++) {
+		struct dpd_wan *w = bpf_map_lookup_elem(&dpd_wans, &i);
+
+		if (w && w->ifindex == ifindex)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Weighted rendezvous over the healthy uplinks. Returns a 0-based index or -1.
+ *
+ * Rendezvous (highest random weight) is used instead of a modulo: adding or
+ * removing a WAN, or changing a weight, only moves the flows that hash to the
+ * affected node, and the choice is a pure function of the 5-tuple, so two
+ * packets of one flow never disagree.
+ */
+static __always_inline int dpd_pick_wan(const struct dpd_flow_key *k)
+{
+	__u64 best = 0;
+	int best_i = -1;
+
+	#pragma unroll
+	for (__u32 i = 0; i < DPD_WAN_MAX; i++) {
+		struct dpd_wan *w = bpf_map_lookup_elem(&dpd_wans, &i);
+		__u64 score;
+		__u32 h;
+
+		if (!w || !w->ifindex || !w->weight || !(w->flags & DPD_WAN_F_UP))
+			continue;
+		h = dpd_flow_hash(k, 0x9e3779b9u * (i + 1));
+		score = (__u64)h * w->weight;
+		if (score > best) {
+			best = score;
+			best_i = i;
+		}
+	}
+	return best_i;
 }
 
 /*
@@ -661,6 +733,34 @@ int dpd_fastpath(struct __sk_buff *skb)
 				return TC_ACT_UNSPEC;
 			}
 
+			if (fval->wan) {
+				__u32 wi = fval->wan - 1;
+				struct dpd_wan *w = bpf_map_lookup_elem(&dpd_wans, &wi);
+
+				/* an uplink that went away or was disabled makes
+				 * the entry stale: fall through and re-learn */
+				if (w && w->ifindex == egress &&
+				    (w->flags & DPD_WAN_F_UP)) {
+					stat_add(ST_FLOW_HIT, 1);
+					fval->last_seen_ms = now;
+					if (fkey.family == AF_INET)
+						ret = dpd_dec_ttl_v4(skb, data, data_end, l3_off);
+					else
+						ret = dpd_dec_hop_v6(data, data_end, l3_off);
+					if (ret > 0) {
+						stat_add(ST_TTL_DROP, 1);
+						return TC_ACT_SHOT;
+					}
+					if (ret < 0)
+						return TC_ACT_UNSPEC;
+					ret = dpd_emit_l2(skb, egress, w->gw_mac,
+							  w->dev_mac);
+					if (ret == TC_ACT_REDIRECT)
+						return ret;
+					return TC_ACT_UNSPEC;
+				}
+			}
+
 			stat_add(ST_FLOW_HIT, 1);
 			fval->last_seen_ms = now;
 			/* a remembered "no neighbour" egress must not go through
@@ -739,6 +839,37 @@ int dpd_fastpath(struct __sk_buff *skb)
 		nv.flags = no_neigh ? DPD_FLOW_F_NO_NEIGH : 0;
 		__builtin_memcpy(nv.dmac, fib.dmac, ETH_ALEN);
 		__builtin_memcpy(nv.smac, fib.smac, ETH_ALEN);
+		nv.wan = 0;
+
+		/*
+		 * Multi-WAN: pick an uplink by weighted rendezvous and steer the
+		 * slow path of this new flow with a fwmark (the daemon installs
+		 * `ip rule fwmark <mark> lookup <table>` plus a default route per
+		 * WAN). Only for packets that did not arrive on an uplink --
+		 * downlink traffic already has its egress (the LAN).
+		 *
+		 * The FIB lookup above still decides "is this forwardable at
+		 * all" (local/unreachable packets return early), it just no
+		 * longer decides *which* uplink.
+		 */
+		if (!dpd_is_uplink(skb->ifindex)) {
+			int wi = dpd_pick_wan(&fkey);
+
+			if (wi >= 0) {
+				__u32 k2 = wi;
+				struct dpd_wan *w = bpf_map_lookup_elem(&dpd_wans, &k2);
+
+				if (w && w->ifindex) {
+					nv.egress_ifindex = w->ifindex;
+					nv.wan = wi + 1;
+					nv.flags = 0;
+					__builtin_memcpy(nv.dmac, w->gw_mac, ETH_ALEN);
+					__builtin_memcpy(nv.smac, w->dev_mac, ETH_ALEN);
+					skb->mark = w->mark;
+				}
+			}
+		}
+
 		bpf_map_update_elem(&dpd_flows, &fkey, &nv, BPF_ANY);
 		stat_add(ST_FLOW_WRITE, 1);
 		return TC_ACT_UNSPEC;
