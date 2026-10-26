@@ -455,6 +455,22 @@ int dpd_fastpath(struct __sk_buff *skb)
 		fib.family = AF_INET;
 		fib.l4_protocol = iph->protocol;
 		fib.tot_len = bpf_ntohs(iph->tot_len);
+		/*
+		 * GRO/GSO: the header carries the *aggregate* length (up to 64 KB),
+		 * which is larger than the MTU. bpf_fib_lookup() then answers
+		 * FRAG_NEEDED and the packet is refused -- so the bulk of the bytes
+		 * (the coalesced segments) never took the fast path, only the small
+		 * ones did. Measured 2026-10-27 with GRO on: fib_ok 100k vs
+		 * fib_fail 145k, i.e. 60% of packets (and most of the bytes) went
+		 * the slow path; with GRO off fib_fail fell to 0 but throughput
+		 * dropped from 4.5 to 0.95 Gbit/s because the packet count tripled.
+		 *
+		 * The MTU test only needs to hold for one segment: the device (TSO)
+		 * or software GSO segments the skb on egress. So test with the
+		 * segment size when the skb is GSO.
+		 */
+		if (skb->gso_size && fib.tot_len > skb->gso_size)
+			fib.tot_len = skb->gso_size;
 		fib.ipv4_src = iph->saddr;
 		fib.ipv4_dst = iph->daddr;
 		l4 = iph->protocol;
