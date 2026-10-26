@@ -241,17 +241,66 @@ static __always_inline int dpd_is_dns(__u8 proto, __be16 dport)
 	return bpf_ntohs(dport) == 53;
 }
 
-static __always_inline int dpd_may_accelerate(const struct dpd_config *cfg,
-					      __u8 family, __u16 vlan_id,
-					      __u8 tagged, __u8 proto,
-					      __be16 dport)
+/*
+ * DHCP belongs to the local server, never to a next hop.
+ *
+ * A DISCOVER is 0.0.0.0:68 -> 255.255.255.255:67. bpf_fib_lookup() answers
+ * happily (the default route matches a broadcast destination), and
+ * bpf_redirect_neigh() then ships the packet out the WAN -- netfilter and
+ * odhcpd are skipped, so no offer is ever produced. Measured on 2026-10-27:
+ * two DISCOVERs -> pkt_total +2, fib_ok +2, neigh_ok +2, client got no lease;
+ * stopping dpd made the same client lease 192.168.10.204 immediately.
+ *
+ * Both directions are checked because the server's reply (67 -> 68) must also
+ * stay on the LAN.
+ */
+static __always_inline int dpd_is_dhcp(__u8 proto, __be16 sport, __be16 dport)
 {
-	if (family != AF_INET) {
+	if (proto != IPPROTO_UDP)
+		return 0;
+	return bpf_ntohs(sport) == 67 || bpf_ntohs(sport) == 68 ||
+	       bpf_ntohs(dport) == 67 || bpf_ntohs(dport) == 68;
+}
+
+/*
+ * Non-unicast destinations must be delivered locally (or flooded by the
+ * bridge), never routed to a next hop: DHCP, service discovery and the ARP
+ * proxy all depend on that. 0.0.0.0/8 cannot be a unicast destination either.
+ */
+static __always_inline int dpd_is_nonunicast(const struct dpd_flow_key *k)
+{
+	if (k->family == AF_INET) {
+		__u32 d = bpf_ntohl(k->daddr[3]);
+
+		if (d == 0xffffffffu)	/* limited broadcast	*/
+			return 1;
+		if ((d >> 28) == 0xeu)	/* 224.0.0.0/4		*/
+			return 1;
+		if ((d >> 24) == 0u)	/* 0.0.0.0/8		*/
+			return 1;
+		return 0;
+	}
+	return (bpf_ntohl(k->daddr[0]) >> 24) == 0xffu;	/* ff00::/8 */
+}
+
+static __always_inline int dpd_may_accelerate(const struct dpd_config *cfg,
+					      __u16 vlan_id, __u8 tagged,
+					      const struct dpd_flow_key *k)
+{
+	if (k->family != AF_INET) {
 		stat_add(ST_V6_SKIP, 1);
 		return 0;
 	}
-	if (dpd_is_dns(proto, dport)) {
+	if (dpd_is_dns(k->proto, k->dport)) {
 		stat_add(ST_DNS_SKIP, 1);
+		return 0;
+	}
+	if (dpd_is_dhcp(k->proto, k->sport, k->dport)) {
+		stat_add(ST_DHCP_SKIP, 1);
+		return 0;
+	}
+	if (dpd_is_nonunicast(k)) {
+		stat_add(ST_BCAST_SKIP, 1);
 		return 0;
 	}
 	if (cfg->policy == DPD_POLICY_VLANS_ONLY) {
@@ -472,8 +521,7 @@ int dpd_fastpath(struct __sk_buff *skb)
 			/* a remembered "no neighbour" egress must not go through
 			 * bpf_redirect_neigh() on the shortcut path either */
 			no_neigh = !!(fval->flags & DPD_FLOW_F_NO_NEIGH);
-			if (!dpd_may_accelerate(cfg, fkey.family, vlan_id, tagged,
-						fkey.proto, fkey.dport))
+			if (!dpd_may_accelerate(cfg, vlan_id, tagged, &fkey))
 				return TC_ACT_UNSPEC;
 			if (fkey.family == AF_INET) {
 				ret = dpd_dec_ttl_v4(skb, data, data_end, l3_off);
@@ -528,8 +576,7 @@ int dpd_fastpath(struct __sk_buff *skb)
 		struct dpd_flow_val nv = {};
 
 		/* never learn entries we would refuse to use anyway */
-		if (!dpd_may_accelerate(cfg, fkey.family, vlan_id, tagged,
-					fkey.proto, fkey.dport))
+		if (!dpd_may_accelerate(cfg, vlan_id, tagged, &fkey))
 			return TC_ACT_UNSPEC;
 
 		nv.egress_ifindex = fib.ifindex;
@@ -542,8 +589,7 @@ int dpd_fastpath(struct __sk_buff *skb)
 	}
 
 	/* ---- Mode A (and the #14 probe): take the packet over now. ---- */
-	if (!dpd_may_accelerate(cfg, fkey.family, vlan_id, tagged,
-				fkey.proto, fkey.dport))
+	if (!dpd_may_accelerate(cfg, vlan_id, tagged, &fkey))
 		return TC_ACT_UNSPEC;
 
 	if (fkey.family == AF_INET)

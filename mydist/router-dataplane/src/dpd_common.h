@@ -66,7 +66,13 @@
  *    BPF_FIB_LKUP_RET_NO_NEIGH and, before this, EVERY packet on a PPPoE WAN
  *    failed the lookup (measured 2026-10-18: fib_ok 0 / fib_fail 29) and
  *    nothing was ever accelerated. */
-#define DPD_ABI_VERSION		4
+/* 5: added ST_DHCP_SKIP and ST_BCAST_SKIP -- DHCP and every non-unicast
+ *    destination must reach the local stack. A DISCOVER (0.0.0.0 ->
+ *    255.255.255.255, UDP 68->67) matched the default route and was
+ *    redirect_neigh()'d out the WAN, so odhcpd never saw it and LAN clients
+ *    got no lease (measured 2026-10-27: fib_ok +2, neigh_ok +2, no lease;
+ *    with dpd stopped the same client leased 192.168.10.204 immediately). */
+#define DPD_ABI_VERSION		5
 
 /* name of the TC section in the BPF object; dpdctl/init pass this to tc(8) */
 #define DPD_BPF_SECTION		"classifier"
@@ -149,6 +155,12 @@ enum dpd_stat_idx {
 				 * the dev emit path delivered (measured on a
 				 * PPPoE WAN: redirect_ok +9, peer's access log
 				 * recorded the request).			*/
+	ST_DHCP_SKIP,		/* UDP 67/68: the DHCP server is local, a
+				 * DISCOVER to 255.255.255.255 must never be
+				 * redirected. See dpd_is_dhcp().		*/
+	ST_BCAST_SKIP,		/* non-unicast destination (limited broadcast,
+				 * 224/4, ff00::/8): has to be delivered
+				 * locally / flooded, not routed.		*/
 	ST__MAX,
 };
 

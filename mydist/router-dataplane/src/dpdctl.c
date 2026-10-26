@@ -141,6 +141,7 @@ static const char *stat_name(int i)
 		"redirect_ok", "neigh_ok", "neigh_fail", "flow_hit",
 		"flow_miss", "flow_write", "ttl_drop", "local",
 		"v6_skip", "vlan_skip", "frag_skip", "dns_skip", "fib_retry",
+		"dhcp_skip", "bcast_skip",
 	};
 
 	return (i >= 0 && i < ST__MAX && n[i]) ? n[i] : "?";
