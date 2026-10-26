@@ -8,9 +8,13 @@
  *
  * Modes (dpd_cfg.mode):
  *   OBSERVE      do the work but never touch the packet  -> zero risk
- *   STATELESS    every packet: fib -> redirect_neigh
- *   STATEFUL     first packet learns and yields, later packets redirect
+ *   STATELESS    every packet: fib -> emit
+ *   STATEFUL     first packet learns and yields, later packets emit from cache
  *   NEIGH_PROBE  #14: does bpf_redirect_neigh actually work on this iface?
+ *
+ * "emit" is dpd_emit(): on a plain Ethernet egress it writes the L2 header that
+ * bpf_fib_lookup() already produced and calls bpf_redirect(), which skips the
+ * route+neighbour lookup that bpf_redirect_neigh() repeats for every packet.
  *
  * Compile-time default is OBSERVE; the runtime default lives in
  * files/dpd_fastpath.config and is pushed into dpd_cfg by the init script.
@@ -283,6 +287,25 @@ static __always_inline int dpd_is_nonunicast(const struct dpd_flow_key *k)
 	return (bpf_ntohl(k->daddr[0]) >> 24) == 0xffu;	/* ff00::/8 */
 }
 
+/*
+ * The VLAN policy axis, on its own: it is the only gate whose input (the
+ * operator's config and the dpd_vlans map) can change while a flow is live, so
+ * it is the only one the Mode B hit path has to re-check. The other gates
+ * (DNS / DHCP / non-unicast / IPv6) read fields that are *in the flow key*, and
+ * an entry is only learned after they passed, so re-running them on a hit can
+ * only produce the same answer -- see the comment on the hit path.
+ */
+static __always_inline int dpd_policy_ok(const struct dpd_config *cfg,
+					 __u16 vlan_id, __u8 tagged)
+{
+	if (cfg->policy != DPD_POLICY_VLANS_ONLY)
+		return 1;
+	if (tagged && bpf_map_lookup_elem(&dpd_vlans, &vlan_id))
+		return 1;
+	stat_add(ST_VLAN_SKIP, 1);
+	return 0;
+}
+
 static __always_inline int dpd_may_accelerate(const struct dpd_config *cfg,
 					      __u16 vlan_id, __u8 tagged,
 					      const struct dpd_flow_key *k)
@@ -303,26 +326,15 @@ static __always_inline int dpd_may_accelerate(const struct dpd_config *cfg,
 		stat_add(ST_BCAST_SKIP, 1);
 		return 0;
 	}
-	if (cfg->policy == DPD_POLICY_VLANS_ONLY) {
-		__u8 *ok = NULL;
-
-		if (tagged)
-			ok = bpf_map_lookup_elem(&dpd_vlans, &vlan_id);
-		if (!ok) {
-			stat_add(ST_VLAN_SKIP, 1);
-			return 0;
-		}
-	}
-	return 1;
+	return dpd_policy_ok(cfg, vlan_id, tagged);
 }
 
 /*
  * Hand the packet to the device.
- *   AUTO        - redirect_neigh unless the iface says NOARP/POINTOPOINT
- *                 (ppp is exactly that: no neighbour table, and the L2 header
- *                 must not be rewritten)
+ *   AUTO        - write the L2 header we already have and bpf_redirect() when
+ *                 the egress is plain Ethernet; redirect_neigh otherwise
  *   FORCE_NEIGH - always redirect_neigh
- *   FORCE_DEV   - always bpf_redirect(ifindex, 0)  (ppp / veth)
+ *   FORCE_DEV   - always bpf_redirect(ifindex, 0)  (ppp / veth, header untouched)
  *
  * no_neigh is a FACT learned from bpf_fib_lookup: the helper could only find the
  * route with BPF_FIB_LOOKUP_SKIP_NEIGH, i.e. there is no neighbour entry for this
@@ -337,8 +349,69 @@ static __always_inline int dpd_may_accelerate(const struct dpd_config *cfg,
  * device delivers. Before the FIB retry nothing was emitted at all, because every
  * lookup answered NO_NEIGH.
  */
+
+/* is this a plausible 6-byte MAC? bpf_fib_lookup() only fills dmac/smac when it
+ * really found a neighbour and an egress dev_addr, so all-zero means "do not
+ * trust this header" and the caller falls back to redirect_neigh(). */
+static __always_inline int dpd_mac_ok(const __u8 *m)
+{
+	return (m[0] | m[1] | m[2] | m[3] | m[4] | m[5]) != 0;
+}
+
+/*
+ * Emit on a plain Ethernet egress without asking the kernel to look anything up
+ * again.
+ *
+ * bpf_redirect_neigh() returns TC_ACT_REDIRECT immediately; the real work
+ * happens afterwards in skb_do_redirect() -> __bpf_redirect_neigh() ->
+ * bpf_out_neigh_v4(), which runs ip_route_output_flow() *and* resolves the
+ * neighbour for that packet, then builds the L2 header from the neighbour entry
+ * and the egress dev_addr. Both of those answers are already in the
+ * bpf_fib_lookup result we just did: dmac is the neighbour's ha, smac is the
+ * egress device's dev_addr. So the same frame can be produced here with two
+ * 6-byte copies and bpf_redirect(ifindex, 0), which is exactly what the
+ * neighbour output path does with them (net/core/neighbour.c: neigh_output() ->
+ * dev_hard_header() -> dev_queue_xmit()).
+ *
+ * What this removes per packet: one full FIB lookup, one neighbour table lookup
+ * (plus the dst_entry/refcount dance around it), and one skb_dst_set(). It is
+ * hardware independent -- it is kernel dataplane work, not a NIC feature.
+ *
+ * When it is NOT used (the caller decides, see the l2_ok/no_neigh conditions):
+ *   - the ingress frame was VLAN tagged: the tag lives in the frame and an
+ *     egress that is itself a VLAN sub-interface would push a second one;
+ *   - there was no neighbour (ppp, tunnels) -- nothing to write;
+ *   - the egress device is stacked (DPD_IF_F_LOWER: vlan/veth/macvlan/tunnel),
+ *     where dev_hard_header() does more than copy twelve bytes;
+ *   - dmac/smac came back zero, i.e. do not trust them.
+ * In all of those cases the caller keeps bpf_redirect_neigh().
+ *
+ * Returns TC_ACT_REDIRECT when it took the packet, -1 when the caller must fall
+ * back. Counted as ST_REDIRECT_OK, like every other bpf_redirect() emit.
+ */
+static __always_inline int dpd_emit_l2(struct __sk_buff *skb, struct ethhdr *eth,
+				       void *data_end, __u32 ifindex,
+				       const __u8 *dmac, const __u8 *smac)
+{
+	if ((void *)(eth + 1) > data_end)
+		return -1;
+	if (!dpd_mac_ok(dmac) || !dpd_mac_ok(smac))
+		return -1;
+
+	__builtin_memcpy(eth->h_dest, dmac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, smac, ETH_ALEN);
+
+	if (bpf_redirect(ifindex, 0) != TC_ACT_REDIRECT)
+		return -1;
+	stat_add(ST_REDIRECT_OK, 1);
+	return TC_ACT_REDIRECT;
+}
+
 static __always_inline int dpd_emit(struct __sk_buff *skb, __u32 ifindex,
-				    struct dpd_config *cfg, int no_neigh)
+				    struct dpd_config *cfg, int no_neigh,
+				    struct ethhdr *eth, void *data_end,
+				    __u8 l2_ok, const __u8 *dmac,
+				    const __u8 *smac)
 {
 	__u32 *p = bpf_map_lookup_elem(&dpd_iface, &ifindex);
 	__u32 flags = p ? *p : 0;
@@ -352,6 +425,13 @@ static __always_inline int dpd_emit(struct __sk_buff *skb, __u32 ifindex,
 		goto dev;
 	if (flags & (DPD_IF_F_NOARP | DPD_IF_F_POINTOPOINT))
 		goto dev;
+
+	/* AUTO on Ethernet: emit with the L2 header the FIB lookup handed us. */
+	if (l2_ok && !(flags & DPD_IF_F_LOWER)) {
+		r = dpd_emit_l2(skb, eth, data_end, ifindex, dmac, smac);
+		if (r == TC_ACT_REDIRECT)
+			return r;
+	}
 
 neigh:
 	/* WHAT THESE COUNTERS MEAN, because the name lies: this helper returns
@@ -524,20 +604,37 @@ int dpd_fastpath(struct __sk_buff *skb)
 
 	/* ---- Mode B: try the self-learned shortcut first ---- */
 	if (cfg->mode == DPD_MODE_STATEFUL) {
-		__u64 now = bpf_ktime_get_ns();
-		__u64 ttl_ns = (__u64)cfg->flow_ttl_ms * 1000000ULL;
+		__u32 now = (__u32)(bpf_ktime_get_ns() / 1000000ULL);
+		__u32 ttl = cfg->flow_ttl_ms;
+		__s32 age;
 
+		/* the freshness test is a *signed* difference: last_seen_ms is a
+		 * 32-bit truncation, so an absolute compare would expire every
+		 * flow once per 49.7 days. A negative age means the timestamp is
+		 * "in the future" (that only happens across that wrap for an
+		 * entry nobody refreshed) and is treated as expired. */
+		if (ttl > 86400000u)	/* one day: keep the cast in range */
+			ttl = 86400000u;
 		fval = bpf_map_lookup_elem(&dpd_flows, &fkey);
-		if (fval && fval->egress_ifindex &&
-		    now - fval->last_seen_ns < ttl_ns) {
+		age = fval ? (__s32)(now - fval->last_seen_ms) : 0;
+		if (fval && fval->egress_ifindex && age >= 0 && age < (__s32)ttl) {
 			__u32 egress = fval->egress_ifindex;
 
 			stat_add(ST_FLOW_HIT, 1);
-			fval->last_seen_ns = now;
+			fval->last_seen_ms = now;
 			/* a remembered "no neighbour" egress must not go through
 			 * bpf_redirect_neigh() on the shortcut path either */
 			no_neigh = !!(fval->flags & DPD_FLOW_F_NO_NEIGH);
-			if (!dpd_may_accelerate(cfg, vlan_id, tagged, &fkey))
+			/* Only the VLAN policy is re-checked here. Every other
+			 * gate in dpd_may_accelerate() reads a field that is part
+			 * of dpd_flow_key (family/proto/ports/daddr) and the entry
+			 * was only written after those gates passed, so on a hit
+			 * they can only answer the same thing again -- three
+			 * branches, three counters and, for :53 and DHCP, two
+			 * bpf_ntohs() per packet that the hit path does not need.
+			 * The policy can be changed by the operator while a flow
+			 * is live, so it stays. */
+			if (!dpd_policy_ok(cfg, vlan_id, tagged))
 				return TC_ACT_UNSPEC;
 			if (fkey.family == AF_INET) {
 				ret = dpd_dec_ttl_v4(skb, data, data_end, l3_off);
@@ -550,7 +647,8 @@ int dpd_fastpath(struct __sk_buff *skb)
 			}
 			if (ret < 0)
 				return TC_ACT_UNSPEC;
-			return dpd_emit(skb, egress, cfg, no_neigh);
+			return dpd_emit(skb, egress, cfg, no_neigh, eth, data_end,
+					!tagged, fval->dmac, fval->smac);
 		}
 		stat_add(ST_FLOW_MISS, 1);
 	}
@@ -596,9 +694,10 @@ int dpd_fastpath(struct __sk_buff *skb)
 			return TC_ACT_UNSPEC;
 
 		nv.egress_ifindex = fib.ifindex;
-		nv.last_seen_ns = bpf_ktime_get_ns();
+		nv.last_seen_ms = (__u32)(bpf_ktime_get_ns() / 1000000ULL);
 		nv.flags = no_neigh ? DPD_FLOW_F_NO_NEIGH : 0;
 		__builtin_memcpy(nv.dmac, fib.dmac, ETH_ALEN);
+		__builtin_memcpy(nv.smac, fib.smac, ETH_ALEN);
 		bpf_map_update_elem(&dpd_flows, &fkey, &nv, BPF_ANY);
 		stat_add(ST_FLOW_WRITE, 1);
 		return TC_ACT_UNSPEC;
@@ -619,7 +718,8 @@ int dpd_fastpath(struct __sk_buff *skb)
 	if (ret < 0)
 		return TC_ACT_UNSPEC;
 
-	return dpd_emit(skb, fib.ifindex, cfg, no_neigh);
+	return dpd_emit(skb, fib.ifindex, cfg, no_neigh, eth, data_end, !tagged,
+			fib.dmac, fib.smac);
 
 non_ip:
 	stat_add(ST_NON_IP, 1);

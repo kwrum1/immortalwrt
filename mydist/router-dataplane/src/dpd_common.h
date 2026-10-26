@@ -71,8 +71,13 @@
  *    255.255.255.255, UDP 68->67) matched the default route and was
  *    redirect_neigh()'d out the WAN, so odhcpd never saw it and LAN clients
  *    got no lease (measured 2026-10-27: fib_ok +2, neigh_ok +2, no lease;
- *    with dpd stopped the same client leased 192.168.10.204 immediately). */
-#define DPD_ABI_VERSION		5
+ *    with dpd stopped the same client leased 192.168.10.204 immediately).
+ * 6: dpd_flow_val now carries the L2 header (smac next to dmac) and a 32-bit
+ *    millisecond timestamp, so the redirect can be a plain bpf_redirect()
+ *    instead of bpf_redirect_neigh() -- the latter re-runs the route lookup and
+ *    the neighbour lookup for every packet. The value stays 24 bytes, so an
+ *    object upgrade can reuse the pinned map (see dpd_flow_val). */
+#define DPD_ABI_VERSION		6
 
 /* name of the TC section in the BPF object; dpdctl/init pass this to tc(8) */
 #define DPD_BPF_SECTION		"classifier"
@@ -108,9 +113,16 @@ enum dpd_policy {
 
 /* how to place the packet on the wire once the FIB says "forward me" */
 enum dpd_redirect {
-	DPD_REDIR_AUTO		= 0,	/* _neigh unless iface flags say NOARP */
-	DPD_REDIR_FORCE_NEIGH	= 1,
-	DPD_REDIR_FORCE_DEV	= 2,	/* bpf_redirect(ifindex,0) - ppp / veth */
+	DPD_REDIR_AUTO		= 0,	/* bpf_redirect() with the header the
+					 * FIB lookup already gave us, when the
+					 * egress is a plain Ethernet device;
+					 * bpf_redirect_neigh() otherwise (ppp,
+					 * tunnels, VLAN/lower devices)	*/
+	DPD_REDIR_FORCE_NEIGH	= 1,	/* always bpf_redirect_neigh(), i.e. a
+					 * route + neighbour lookup per packet.
+					 * The pre-ABI-6 behaviour; keep it as
+					 * the escape hatch			*/
+	DPD_REDIR_FORCE_DEV	= 2,	/* bpf_redirect(ifindex, 0) - ppp / veth */
 };
 
 struct dpd_config {
@@ -168,6 +180,14 @@ enum dpd_stat_idx {
 #define DPD_IF_F_NOARP		0x0001	/* IFF_NOARP		*/
 #define DPD_IF_F_POINTOPOINT	0x0002	/* IFF_POINTOPOINT	*/
 #define DPD_IF_F_UP		0x0004	/* IFF_UP		*/
+/* The device is stacked on a lower one (/sys/class/net/X/iflink != X's own
+ * index): a VLAN sub-interface, a veth peer, a macvlan, a tunnel. Such a device
+ * builds its L2 header in dev_hard_header() -- a VLAN device pushes the 802.1Q
+ * tag there -- so writing the header ourselves and calling bpf_redirect() would
+ * emit a frame that is wrong (untagged where a tag was owed, or tagged twice).
+ * The cheap Ethernet emit path (dpd_emit_l2()) is therefore skipped for them and
+ * they keep using bpf_redirect_neigh(). Taught by `dpdctl ifaces`. */
+#define DPD_IF_F_LOWER		0x0008
 
 /* dpd_flow_val.flags: Mode B remembered that this egress has no neighbour
  * (a FIB lookup needed BPF_FIB_LOOKUP_SKIP_NEIGH), so the shortcut hit path must
@@ -190,11 +210,28 @@ struct dpd_flow_key {
 	__be16	dport;
 };
 
+/*
+ * Mode B flow value -- 24 bytes, and that size is part of the pinned-map ABI: a
+ * bpf_map_update_elem() value that changed size makes libbpf refuse to reuse
+ * /sys/fs/bpf/dpd_flows, i.e. `tc filter add` fails after an in-place upgrade
+ * until the pin is removed. Keep it at 24.
+ *
+ * dmac/smac are the pair bpf_fib_lookup() filled in for this flow. Caching them
+ * is what lets the hit path emit with bpf_redirect() instead of
+ * bpf_redirect_neigh(); see dpd_emit_l2() in the BPF program.
+ *
+ * last_seen_ms is CLOCK_MONOTONIC in milliseconds (the same clock as
+ * bpf_ktime_get_ns()), truncated to 32 bits: it wraps every ~49.7 days, so the
+ * freshness test is done on the *signed difference* (age >= 0 && age < ttl),
+ * never on an absolute comparison. That buys us 4 bytes for smac without growing
+ * the entry.
+ */
 struct dpd_flow_val {
 	__u32	egress_ifindex;
-	__u64	last_seen_ns;
-	__u8	dmac[6];	/* for the force-dev (bpf_redirect) path */
-	__u16	flags;		/* DPD_FLOW_F_* (was padding)		*/
+	__u32	last_seen_ms;	/* bpf_ktime_get_ns()/1e6, wraps	*/
+	__u8	dmac[6];	/* next hop MAC from the FIB lookup	*/
+	__u8	smac[6];	/* egress dev_addr from the FIB lookup	*/
+	__u16	flags;		/* DPD_FLOW_F_*				*/
 };
 
 #endif /* __DPD_COMMON_H */

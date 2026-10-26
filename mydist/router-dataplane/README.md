@@ -161,14 +161,33 @@ VLAN 列表每次启动都**从 uci 重建**（先 `vlan flush`），不会留�
 
 ### 2.4 `redirect` 策略（`option redirect`）
 
-* `auto`（默认）：以太网走 `bpf_redirect_neigh()`；若目标接口
-  `IFF_NOARP`（ppp 就是 `IFF_POINTOPOINT|IFF_NOARP`）则退化为
-  `bpf_redirect(ifindex, 0)`。
-* `neigh`：一律 `bpf_redirect_neigh()`。
-* `dev`：一律 `bpf_redirect(ifindex, 0)`。
+* `auto`（默认）：**以太网出口上用 `bpf_redirect()`**，直接把 `bpf_fib_lookup()`
+  已经给出的 `dmac`/`smac` 写进以太头，然后 `bpf_redirect(ifindex, 0)`；其余情况
+  （ppp/隧道/VLAN 子接口/无邻居）退化到 `bpf_redirect_neigh()`。
+* `neigh`：一律 `bpf_redirect_neigh()`（ABI 6 之前的行为，留作逃生口）。
+* `dev`：一律 `bpf_redirect(ifindex, 0)`，不改写 L2 头（ppp/veth 专用）。
+
+**为什么 `auto` 不再每包 `redirect_neigh`**：`bpf_redirect_neigh()` 只是把包收下
+（立刻返回 `TC_ACT_REDIRECT`），真正的路由查找和邻居解析发生在之后的
+`skb_do_redirect() -> __bpf_redirect_neigh() -> bpf_out_neigh_v4()` 里，也就是**每个包
+再做一次 `ip_route_output_flow()` + 邻居查表**，然后用邻居表里的 `ha` 和出口设备的
+`dev_addr` 拼 L2 头。而这两样东西 `bpf_fib_lookup()` 刚刚已经填在 `fib.dmac` /
+`fib.smac` 里了（实测确认非零，见 §5）。所以以太网出口上完全可以把同样 12 字节拷进
+以太头，再 `bpf_redirect(ifindex, 0)` —— 丢掉的是**每包一次 FIB + 一次邻居查找**，
+得到的是同一帧。这是内核数据面的工作量，和网卡/平台无关，x86 与 ARM64 同等受益。
+
+不适用（自动回落 `redirect_neigh`，都是"这一帧不该由我们拼头"的情形）：
+
+| 情形 | 原因 |
+|---|---|
+| 入向帧带 VLAN tag | tag 在帧里；若出口本身是 VLAN 子接口，`dev_hard_header()` 会再压一个 |
+| 出口设备是叠层设备（`DPD_IF_F_LOWER`：vlan/veth/macvlan/隧道，`iflink != ifindex`） | `dev_hard_header()` 不只是拷 12 字节 |
+| `bpf_fib_lookup` 只靠 `BPF_FIB_LOOKUP_SKIP_NEIGH` 才成功（ppp/隧道） | 根本没有邻居可写 |
+| `dmac`/`smac` 为全零 | 不可信，不猜 |
 
 `auto` 的退化路径是**刻意的**：`bpf_redirect_neigh()` 需要邻居子系统解析下一跳，
 而 ppp 口没有 ARP，理论上不适用。
+
 
 **实测结论（2026-10-17，x86_64 QEMU，`build/qemu-dpd-diag.sh`）**：以太网 WAN 上
 `bpf_redirect_neigh(ifindex, NULL, 0, 0)` 的 NULL-params 路径**确实能用** —— 出厂

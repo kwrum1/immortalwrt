@@ -36,6 +36,18 @@ static uint64_t mono_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+/* Age of a dpd_flow_val: the BPF side stores CLOCK_MONOTONIC truncated to 32
+ * bits of milliseconds, so the difference has to be taken modulo 2^32 and read
+ * as signed (see dpd_flow_val in dpd_common.h). Negative means "timestamp in
+ * the future", i.e. the entry predates one 49.7-day wrap: report it as stale. */
+static uint64_t flow_age_ms(uint32_t last_seen_ms)
+{
+	uint32_t now = (uint32_t)(mono_ns() / 1000000ULL);
+	int32_t age = (int32_t)(now - last_seen_ms);
+
+	return age > 0 ? (uint64_t)age : 0;
+}
+
 static const char *pin_path(const char *name)
 {
 	static char buf[128];
@@ -259,10 +271,11 @@ static int cmd_show(void)
 		uint32_t v = 0;
 
 		if (!bpf_map_lookup_elem(fd, &k, &v))
-			printf("  %-16s 0x%08x%s%s%s\n", ifname(k.ifindex), v,
+			printf("  %-16s 0x%08x%s%s%s%s\n", ifname(k.ifindex), v,
 			       v & DPD_IF_F_UP ? " UP" : "",
 			       v & DPD_IF_F_NOARP ? " NOARP" : "",
-			       v & DPD_IF_F_POINTOPOINT ? " POINTOPOINT" : "");
+			       v & DPD_IF_F_POINTOPOINT ? " POINTOPOINT" : "",
+			       v & DPD_IF_F_LOWER ? " LOWER" : "");
 		if (bpf_map_get_next_key(fd, &k, &nk))
 			break;
 		k = nk;
@@ -329,6 +342,7 @@ static int cmd_ifaces(int argc, char **argv)
 		uint32_t v = 0;
 		FILE *f;
 		unsigned long flags = 0;
+		unsigned long iflink = 0;
 
 		if (!ifindex) {
 			fprintf(stderr, "dpdctl: no such iface '%s'\n", argv[i]);
@@ -344,19 +358,32 @@ static int cmd_ifaces(int argc, char **argv)
 		}
 		fclose(f);
 
+		/* iflink != ifindex: the device is stacked on a lower one (vlan,
+		 * macvlan, veth, tunnel). dev_hard_header() does real work for
+		 * those, so the BPF side must not write the L2 header itself. */
+		snprintf(path, sizeof(path), "/sys/class/net/%s/iflink", argv[i]);
+		f = fopen(path, "r");
+		if (f) {
+			if (fscanf(f, "%lx", &iflink) != 1)
+				iflink = 0;
+			fclose(f);
+		}
+
 		if (flags & IFF_UP)		v |= DPD_IF_F_UP;
 		if (flags & IFF_NOARP)		v |= DPD_IF_F_NOARP;
 		if (flags & IFF_POINTOPOINT)	v |= DPD_IF_F_POINTOPOINT;
+		if (iflink && iflink != ifindex) v |= DPD_IF_F_LOWER;
 
 		if (bpf_map_update_elem(fd, &ifindex, &v, BPF_ANY)) {
 			fprintf(stderr, "dpdctl: update dpd_iface[%s]: %s\n",
 				argv[i], strerror(errno));
 			return 1;
 		}
-		printf("%-16s ifindex=%-4u flags=0x%08x%s%s%s\n", argv[i], ifindex, v,
+		printf("%-16s ifindex=%-4u flags=0x%08x%s%s%s%s\n", argv[i], ifindex, v,
 		       v & DPD_IF_F_UP ? " UP" : "",
 		       v & DPD_IF_F_NOARP ? " NOARP" : "",
-		       v & DPD_IF_F_POINTOPOINT ? " POINTOPOINT" : "");
+		       v & DPD_IF_F_POINTOPOINT ? " POINTOPOINT" : "",
+		       v & DPD_IF_F_LOWER ? " LOWER" : "");
 	}
 	return 0;
 }
@@ -376,17 +403,19 @@ static int cmd_flows(int argc, char **argv)
 		return 0;
 	for (;;) {
 		if (!bpf_map_lookup_elem(fd, &k, &v)) {
-			uint64_t age_ms = 0;
+			uint64_t age_ms = flow_age_ms(v.last_seen_ms);
 
-			if (mono_ns() > v.last_seen_ns)
-				age_ms = (mono_ns() - v.last_seen_ns) / 1000000ULL;
 			printf("%-10s fam=%u proto=%u egress=%-10s age=%llums "
-			       "dmac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+			       "dmac=%02x:%02x:%02x:%02x:%02x:%02x "
+			       "smac=%02x:%02x:%02x:%02x:%02x:%02x%s\n",
 			       ifname(k.ifindex), k.family, k.proto,
 			       ifname(v.egress_ifindex),
 			       (unsigned long long)age_ms,
 			       v.dmac[0], v.dmac[1], v.dmac[2],
-			       v.dmac[3], v.dmac[4], v.dmac[5]);
+			       v.dmac[3], v.dmac[4], v.dmac[5],
+			       v.smac[0], v.smac[1], v.smac[2],
+			       v.smac[3], v.smac[4], v.smac[5],
+			       (v.flags & DPD_FLOW_F_NO_NEIGH) ? " no-neigh" : "");
 			if (++n >= max)
 				break;
 		}
