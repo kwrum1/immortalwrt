@@ -389,10 +389,17 @@ static __always_inline int dpd_mac_ok(const __u8 *m)
  * Returns TC_ACT_REDIRECT when it took the packet, -1 when the caller must fall
  * back. Counted as ST_REDIRECT_OK, like every other bpf_redirect() emit.
  */
-static __always_inline int dpd_emit_l2(struct __sk_buff *skb, struct ethhdr *eth,
-				       void *data_end, __u32 ifindex,
+static __always_inline int dpd_emit_l2(struct __sk_buff *skb, __u32 ifindex,
 				       const __u8 *dmac, const __u8 *smac)
 {
+	/* re-derived here rather than passed in: the pointer has to be a fresh
+	 * PTR_TO_PACKET with a range check on this path, and an `eth` argument
+	 * that survives through the FIB/flow-map code confuses the verifier
+	 * ("invalid mem access 'scalar'" on the store). Two loads, no cost. */
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct ethhdr *eth = data;
+
 	if ((void *)(eth + 1) > data_end)
 		return -1;
 	if (!dpd_mac_ok(dmac) || !dpd_mac_ok(smac))
@@ -409,7 +416,6 @@ static __always_inline int dpd_emit_l2(struct __sk_buff *skb, struct ethhdr *eth
 
 static __always_inline int dpd_emit(struct __sk_buff *skb, __u32 ifindex,
 				    struct dpd_config *cfg, int no_neigh,
-				    struct ethhdr *eth, void *data_end,
 				    __u8 l2_ok, const __u8 *dmac,
 				    const __u8 *smac)
 {
@@ -428,7 +434,7 @@ static __always_inline int dpd_emit(struct __sk_buff *skb, __u32 ifindex,
 
 	/* AUTO on Ethernet: emit with the L2 header the FIB lookup handed us. */
 	if (l2_ok && !(flags & DPD_IF_F_LOWER)) {
-		r = dpd_emit_l2(skb, eth, data_end, ifindex, dmac, smac);
+		r = dpd_emit_l2(skb, ifindex, dmac, smac);
 		if (r == TC_ACT_REDIRECT)
 			return r;
 	}
@@ -647,8 +653,8 @@ int dpd_fastpath(struct __sk_buff *skb)
 			}
 			if (ret < 0)
 				return TC_ACT_UNSPEC;
-			return dpd_emit(skb, egress, cfg, no_neigh, eth, data_end,
-					!tagged, fval->dmac, fval->smac);
+			return dpd_emit(skb, egress, cfg, no_neigh, !tagged,
+					fval->dmac, fval->smac);
 		}
 		stat_add(ST_FLOW_MISS, 1);
 	}
@@ -718,8 +724,8 @@ int dpd_fastpath(struct __sk_buff *skb)
 	if (ret < 0)
 		return TC_ACT_UNSPEC;
 
-	return dpd_emit(skb, fib.ifindex, cfg, no_neigh, eth, data_end, !tagged,
-			fib.dmac, fib.smac);
+	return dpd_emit(skb, fib.ifindex, cfg, no_neigh, !tagged, fib.dmac,
+			fib.smac);
 
 non_ip:
 	stat_add(ST_NON_IP, 1);
