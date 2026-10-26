@@ -338,8 +338,11 @@ dpd_reconcile_uplink() {
 		fi
 		dpd_teach_iface "$d"
 	done
-	[ "$downlink" = 1 ] && dpd_log "downlink=1: uplink ingress accelerated for learned flows ($n device(s))"
-	[ "$n" = 0 ] || dpd_log "invariant: removed $n stale uplink attachment(s)"
+	if [ "$downlink" = 1 ]; then
+		dpd_log "downlink=1: uplink ingress accelerated for learned flows ($n device(s))"
+	elif [ "$n" -gt 0 ]; then
+		dpd_log "invariant: removed $n stale uplink attachment(s)"
+	fi
 	return 0
 }
 

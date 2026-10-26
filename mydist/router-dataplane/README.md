@@ -72,8 +72,8 @@ einat 的自证探针（`grep 'ifindex eth1(3) attach_type'`，只匹配**一个
 |---|---|---|---|
 | `off` | 0 | 只看计数，不改包 | 挂上但不介入 |
 | `observe` | 1 | 做 `bpf_fib_lookup`，只计数，绝不碰包 | 排障第一步；门禁不满足时的兜底 |
-| `stateless` | 2 | 每个可转发包：减 TTL 后重定向 | **默认**（LAN 侧） |
-| `stateful` | 3 | 首包学习，后续命中直接重定向 | 需要回程也在同一张表里时用 |
+| `stateless` | 2 | 每个可转发包：减 TTL 后重定向 | 每包都重跑 `bpf_fib_lookup`；`downlink` 在此模式下被拒绝 |
+| `stateful` | 3 | 首包学习、后续命中直接重定向（每方向前两个包仍过栈） | **默认**：每包成本最低，且是 `downlink` 唯一允许的模式 |
 | `neigh-probe` | 9 | 专门回答「`bpf_redirect_neigh()` 在本机/本链路到底能不能用」 | `#14` 的运行时验证 |
 
 ### 2.2 门禁：`mode` 只是**请求**，不是结论
@@ -85,7 +85,7 @@ einat 的自证探针（`grep 'ifindex eth1(3) attach_type'`，只匹配**一个
 |---|---|---|
 | **einat 是否已挂上** | 匹配 einat 自己的程序名（`ingress_rev_snat`/`egress_snat`），**不是**「WAN 上有没有 TCX」—— honk 的 `wan_ingress_l2` 也是 TCX | 降级为 `observe`，日志说明「加速流的回程会被 fw4 丢掉」 |
 | **classic 链上有没有人排在我们后面** | `dpd_chain_guard()` | 降级为 `observe` |
-| **是不是上行口** | 与 netifd 的 wan/wan6 设备比对；配置里写了也不挂 | 跳过该口并记日志 |
+| **是不是上行口** | 与 netifd 的 wan/wan6 设备比对；配置里写了也不挂（`downlink=1` + `stateful` 时例外，由 `dpd_reconcile_uplink()` 显式挂载） | 跳过该口并记日志 |
 | **IPv6** | BPF 程序内判定（`dpd_may_accelerate()`） | 返回 `TC_ACT_UNSPEC`，计 `v6_skip` |
 | **端口 53** | BPF 程序内判定（`dpd_is_dns()`） | 返回 `TC_ACT_UNSPEC`，计 `dns_skip` |
 | **IPv4 分片** | BPF 程序内判定（`frag_off`） | 返回 `TC_ACT_UNSPEC`，计 `frag_skip` |
