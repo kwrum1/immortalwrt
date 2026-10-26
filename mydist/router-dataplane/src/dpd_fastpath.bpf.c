@@ -114,12 +114,12 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } dpd_vlans SEC(".maps");
 
-/* multi-WAN uplinks; owned by the userspace daemon (see dpd_common.h) */
+/* multi-WAN uplinks; one entry holds the whole table (see dpd_common.h) */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, DPD_WAN_MAX);
+	__uint(max_entries, 1);
 	__type(key, __u32);
-	__type(value, struct dpd_wan);
+	__type(value, struct dpd_wan_tbl);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } dpd_wans SEC(".maps");
 
@@ -356,17 +356,29 @@ static __always_inline __u32 dpd_flow_hash(const struct dpd_flow_key *k,
 	return h;
 }
 
+static __always_inline struct dpd_wan_tbl *dpd_wan_tbl(void)
+{
+	__u32 zero = 0;
+
+	return bpf_map_lookup_elem(&dpd_wans, &zero);
+}
+
 /* Is this ingress device one of the uplinks? (downlink hook traffic must not be
- * re-hashed back out another uplink). */
+ * re-hashed back out another uplink). Unrolled: the verifier cannot bound a
+ * loop that contains map lookups, and "infinite loop detected" is what that
+ * looks like at load time. */
 static __always_inline int dpd_is_uplink(__u32 ifindex)
 {
-	#pragma unroll
-	for (__u32 i = 0; i < DPD_WAN_MAX; i++) {
-		struct dpd_wan *w = bpf_map_lookup_elem(&dpd_wans, &i);
+	struct dpd_wan_tbl *t = dpd_wan_tbl();
 
-		if (w && w->ifindex == ifindex)
-			return 1;
-	}
+	if (!t)
+		return 0;
+#define DPD_UP_CHK(i)							\
+	if ((i) < t->count && t->wan[i].ifindex == ifindex)		\
+		return 1;
+	DPD_UP_CHK(0) DPD_UP_CHK(1) DPD_UP_CHK(2) DPD_UP_CHK(3)
+	DPD_UP_CHK(4) DPD_UP_CHK(5) DPD_UP_CHK(6) DPD_UP_CHK(7)
+#undef DPD_UP_CHK
 	return 0;
 }
 
@@ -380,25 +392,48 @@ static __always_inline int dpd_is_uplink(__u32 ifindex)
  */
 static __always_inline int dpd_pick_wan(const struct dpd_flow_key *k)
 {
+	struct dpd_wan_tbl *t = dpd_wan_tbl();
 	__u64 best = 0;
 	int best_i = -1;
 
-	#pragma unroll
-	for (__u32 i = 0; i < DPD_WAN_MAX; i++) {
-		struct dpd_wan *w = bpf_map_lookup_elem(&dpd_wans, &i);
-		__u64 score;
-		__u32 h;
-
-		if (!w || !w->ifindex || !w->weight || !(w->flags & DPD_WAN_F_UP))
-			continue;
-		h = dpd_flow_hash(k, 0x9e3779b9u * (i + 1));
-		score = (__u64)h * w->weight;
-		if (score > best) {
-			best = score;
-			best_i = i;
-		}
-	}
+	if (!t)
+		return -1;
+#define DPD_PICK(i) do {						\
+	struct dpd_wan *w = &t->wan[i];					\
+	if ((i) < t->count && w->ifindex && w->weight &&		\
+	    (w->flags & DPD_WAN_F_UP)) {				\
+		__u32 h = dpd_flow_hash(k, 0x9e3779b9u * ((i) + 1));	\
+		__u64 score = (__u64)h * w->weight;			\
+		if (score > best) {					\
+			best = score;					\
+			best_i = i;					\
+		}							\
+	}								\
+} while (0)
+	DPD_PICK(0); DPD_PICK(1); DPD_PICK(2); DPD_PICK(3);
+	DPD_PICK(4); DPD_PICK(5); DPD_PICK(6); DPD_PICK(7);
+#undef DPD_PICK
 	return best_i;
+}
+
+/* Copy one entry out of the table by value. Unrolled compares instead of
+ * t->wan[wi]: a variable offset into a map value is exactly the kind of thing
+ * the verifier rejects, and 28 bytes on the stack is free. */
+static __always_inline int dpd_wan_get(__u32 wi, struct dpd_wan *out)
+{
+	struct dpd_wan_tbl *t = dpd_wan_tbl();
+
+	if (!t)
+		return -1;
+#define DPD_WAN_CP(i)						\
+	if (wi == (i)) {					\
+		*out = t->wan[i];				\
+		return 0;					\
+	}
+	DPD_WAN_CP(0) DPD_WAN_CP(1) DPD_WAN_CP(2) DPD_WAN_CP(3)
+	DPD_WAN_CP(4) DPD_WAN_CP(5) DPD_WAN_CP(6) DPD_WAN_CP(7)
+#undef DPD_WAN_CP
+	return -1;
 }
 
 /*
@@ -740,14 +775,14 @@ int dpd_fastpath(struct __sk_buff *skb)
 				 * out of a map value and is otherwise an
 				 * unbounded scalar */
 				if (wi < DPD_WAN_MAX) {
-					struct dpd_wan *w =
-						bpf_map_lookup_elem(&dpd_wans, &wi);
+					struct dpd_wan w;
 
 					/* an uplink that went away or was disabled
 					 * makes the entry stale: fall through and
 					 * re-learn */
-					if (w && w->ifindex == egress &&
-					    (w->flags & DPD_WAN_F_UP)) {
+					if (dpd_wan_get(wi, &w) == 0 &&
+					    w.ifindex == egress &&
+					    (w.flags & DPD_WAN_F_UP)) {
 						stat_add(ST_FLOW_HIT, 1);
 						fval->last_seen_ms = now;
 						if (fkey.family == AF_INET)
@@ -760,8 +795,8 @@ int dpd_fastpath(struct __sk_buff *skb)
 						}
 						if (ret < 0)
 							return TC_ACT_UNSPEC;
-						ret = dpd_emit_l2(skb, egress, w->gw_mac,
-								  w->dev_mac);
+						ret = dpd_emit_l2(skb, egress, w.gw_mac,
+								  w.dev_mac);
 						if (ret == TC_ACT_REDIRECT)
 							return ret;
 						return TC_ACT_UNSPEC;
@@ -864,16 +899,15 @@ int dpd_fastpath(struct __sk_buff *skb)
 			int wi = dpd_pick_wan(&fkey);
 
 			if (wi >= 0 && wi < DPD_WAN_MAX) {
-				__u32 k2 = (__u32)wi;
-				struct dpd_wan *w = bpf_map_lookup_elem(&dpd_wans, &k2);
+				struct dpd_wan w;
 
-				if (w && w->ifindex) {
-					nv.egress_ifindex = w->ifindex;
+				if (dpd_wan_get((__u32)wi, &w) == 0 && w.ifindex) {
+					nv.egress_ifindex = w.ifindex;
 					nv.wan = wi + 1;
 					nv.flags = 0;
-					__builtin_memcpy(nv.dmac, w->gw_mac, ETH_ALEN);
-					__builtin_memcpy(nv.smac, w->dev_mac, ETH_ALEN);
-					skb->mark = w->mark;
+					__builtin_memcpy(nv.dmac, w.gw_mac, ETH_ALEN);
+					__builtin_memcpy(nv.smac, w.dev_mac, ETH_ALEN);
+					skb->mark = w.mark;
 				}
 			}
 		}

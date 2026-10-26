@@ -282,4 +282,12 @@ struct dpd_wan {
 	__u8	dev_mac[6];	/* the uplink device's own address	*/
 };
 
+/* One map entry holds the whole table: a single lookup per packet beats eight,
+ * and constant indices keep the verifier happy (no loop it cannot bound). */
+struct dpd_wan_tbl {
+	__u32	count;
+	__u32	_pad;
+	struct dpd_wan wan[DPD_WAN_MAX];
+};
+
 #endif /* __DPD_COMMON_H */
