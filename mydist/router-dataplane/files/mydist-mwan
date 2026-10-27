@@ -111,7 +111,9 @@ reconcile() {
 		ip rule del fwmark "$mark" 2>/dev/null
 		ip rule add fwmark "$mark" lookup "$table" pref "$pref"
 		# NAT instance with its own port range
-		local p1=$((BASE_PORT + i * PORT_STEP)) p2=$((p1 + PORT_STEP - 1))
+		local p1 p2
+		p1=$((BASE_PORT + i * PORT_STEP))
+		p2=$((p1 + PORT_STEP - 1))
 		[ -n "$health" ] || health="${gw:-1.1.1.1}"
 		echo "$ifn $dev $mark $table $pref $weight $health $flags $p1 $p2" >> "$RUN/wans"
 

@@ -271,10 +271,56 @@ einat_notify_datapath() {
 # down a failed instance's cgroup, which is exactly what happened on the first
 # PPPoE boot after this was added.
 
-einat_instance() {
-	local ifname="$1" subnets iface landev wandev
+# Every uplink this box should NAT for.
+#
+# An explicit list wins: `list wans 'wan wan2'` in /etc/config/einat.
+# Otherwise: the default-route device plus every netifd interface named `wan`
+# or `wanN` that currently has a device. That is exactly a dual-PPPoE home
+# setup: sections wan + wan2, devices pppoe-wan / pppoe-wan2 once dialled.
+einat_uplinks() {
+	local list i dev
 
-	procd_open_instance "$CONF"
+	list="$(uci -q get einat.@config[0].wans 2>/dev/null)"
+	if [ -n "$list" ]; then
+		for i in $list; do
+			dev=""
+			network_get_device dev "$i" 2>/dev/null
+			[ -n "$dev" ] && [ -e "/sys/class/net/$dev" ] || continue
+			einat_is_lan_dev "$dev" && continue
+			echo "$dev"
+		done
+		return 0
+	fi
+
+	dev="$(einat_wan_dev 4 2>/dev/null)"
+	[ -n "$dev" ] && echo "$dev"
+	for i in $(ubus list 'network.interface.*' 2>/dev/null |
+		sed 's/^network\.interface\.//'); do
+		case "$i" in wan | wan[0-9]*) ;; *) continue ;; esac
+		dev=""
+		network_get_device dev "$i" 2>/dev/null
+		[ -n "$dev" ] && [ -e "/sys/class/net/$dev" ] || continue
+		einat_is_lan_dev "$dev" && continue
+		echo "$dev"
+	done
+}
+
+# Shift "20000-29999" by index * <range width> so every instance owns a
+# disjoint range (shifting by a fixed 5000 would overlap a 10000-wide range).
+einat_shift_ports() {
+	local base="$1" idx="$2" a b w
+
+	a="${base%-*}"
+	b="${base#*-}"
+	[ "$a" != "$base" ] || { echo "$base"; return; }
+	w=$((b - a + 1))
+	echo "$((a + idx * w))-$((b + idx * w))"
+}
+
+einat_instance() {
+	local ifname="$1" ports="$2" subnets iface landev wandev
+
+	procd_open_instance "$ifname"
 	procd_set_param command "$PROG" -i "$ifname" --ports "$ports"
 
 	[ "$nat44" = 1 ] && procd_append_param command --nat44
@@ -303,44 +349,52 @@ einat_instance() {
 
 	wandev="$(fw4_device "$ifname")"
 	landev="$(fw4_device "${lan_iface:-lan}")"
-
-	if [ -n "$wandev" ] && [ -n "$landev" ]; then
-		procd_open_data
-		json_add_array firewall
-			# einat's external port range must be reachable from outside
-			json_add_object ''
-			json_add_string type rule
-			json_add_string target 'ACCEPT'
-			json_add_string name 'einat: forward wan to lan'
-			json_add_string family 'ipv4'
-			json_add_string proto 'tcp udp icmp'
-			json_add_string src "$wandev"
-			json_add_string dest "$landev"
-			json_close_object
-			# einat IS the NAT: masquerading has to go, otherwise the return
-			# path gets rewritten by conntrack and full-cone is lost
-			json_add_object ''
-			json_add_string type nat
-			json_add_string target 'ACCEPT'
-			json_add_string name 'einat: disable masquerade'
-			json_add_string family 'ipv4'
-			json_add_string proto 'tcp udp icmp'
-			json_add_string src "$wandev"
-			json_close_object
-		json_close_array
-		procd_close_data
-		# Tell start_service that fw4 has something to pick up (see the
-		# reload there).
-		EINAT_FW_DATA=1
-	else
-		logger -t einat "could not resolve devices (wan='$wandev' lan='$landev'); starting without firewall overrides"
-	fi
+	[ -n "$wandev" ] && [ -n "$landev" ] || \
+		logger -t einat "could not resolve devices (wan='$wandev' lan='$landev') for $ifname"
 
 	procd_close_instance
 }
 
+# fw4 overrides, emitted ONCE for the whole service: one ACCEPT per uplink and
+# one masquerade-off per uplink. procd data is service-scoped, so doing this
+# inside einat_instance() (once per WAN) would either duplicate or overwrite.
+einat_fw_data() {
+	local wandev landev
+
+	landev="$(fw4_device "${lan_iface:-lan}")"
+	[ -n "$landev" ] || { logger -t einat "no LAN device; no firewall overrides"; return 1; }
+
+	procd_open_data
+	json_add_array firewall
+	for wandev in $EINAT_DEVS; do
+		# einat's external port range must be reachable from outside
+		json_add_object ''
+		json_add_string type rule
+		json_add_string target 'ACCEPT'
+		json_add_string name "einat: forward $wandev to lan"
+		json_add_string family 'ipv4'
+		json_add_string proto 'tcp udp icmp'
+		json_add_string src "$wandev"
+		json_add_string dest "$landev"
+		json_close_object
+		# einat IS the NAT: masquerading has to go, otherwise the return
+		# path gets rewritten by conntrack and full-cone is lost
+		json_add_object ''
+		json_add_string type nat
+		json_add_string target 'ACCEPT'
+		json_add_string name "einat: disable masquerade on $wandev"
+		json_add_string family 'ipv4'
+		json_add_string proto 'tcp udp icmp'
+		json_add_string src "$wandev"
+		json_close_object
+	done
+	json_close_array
+	procd_close_data
+	return 0
+}
+
 start_service() {
-	local wanifname landev iface
+	local landing landev iface dev idx ports_i devs
 
 	config_load "$CONF"
 	config_get_bool enabled      config enabled 0
@@ -360,15 +414,17 @@ start_service() {
 		return 0
 	fi
 
-	# nat66 uses the v6 WAN, nat44 the v4 one; the config default is nat44.
-	if [ "$nat66" = 1 ]; then
-		wanifname="$(einat_wan_dev 6)"
+	# A configured single `ifname` is authoritative (old behaviour, and the only
+	# sane choice for nat66).
+	if [ -n "$ifname" ]; then
+		devs="$ifname"
+	elif [ "$nat66" = 1 ]; then
+		devs="$(einat_wan_dev 6)"
 	else
-		wanifname="$(einat_wan_dev 4)"
+		devs="$(einat_uplinks | awk '!seen[$0]++')"
 	fi
 
-	ifname="${ifname:-$wanifname}"
-	if [ -z "$ifname" ]; then
+	if [ -z "$devs" ]; then
 		# Not an error: a pppoe WAN only exists after the link dials. Supervise
 		# the waiter as a procd instance -- the first version forked it from here
 		# and returned 1, and procd tore the failed instance's cgroup down,
@@ -391,22 +447,26 @@ start_service() {
 	network_get_device landev "$lan_iface"
 	[ -n "$landev" ] || logger -t einat "no internal device resolved for '$lan_iface'"
 
-	logger -t einat "starting: ifname=$ifname ports=$ports nat44=$nat44 hairpin=$hairpin_enabled lan=${landev:-?}"
-	EINAT_FW_DATA=0
-	einat_instance "$ifname"
+	# One procd instance per uplink, each with its own port range.
+	EINAT_DEVS=""
+	idx=0
+	for dev in $devs; do
+		ports_i="$(einat_shift_ports "$ports" "$idx")"
+		logger -t einat "starting instance $idx: ifname=$dev ports=$ports_i nat44=$nat44 hairpin=$hairpin_enabled lan=${landev:-?}"
+		einat_instance "$dev" "$ports_i"
+		EINAT_DEVS="$EINAT_DEVS $dev"
+		idx=$((idx + 1))
+	done
 
-	# fw4 only reads the overrides emitted above when IT reloads, and it is
-	# started well before us (START=19 vs 60). On a boot with einat enabled the
-	# data would therefore never be consumed: masquerading would stay on, einat
-	# would rewrite on the TC hook AND conntrack would rewrite the return path,
-	# which is exactly what destroys full cone. Reload in the background so
-	# procd is not held up, and let the hotplug hook handle the case where the
-	# WAN only appears later (pppoe-wan).
-	if [ "${EINAT_FW_DATA:-0}" = 1 ]; then
+	# fw4 only reads the overrides when IT reloads, and it is started well before
+	# us (START=19 vs 60). Reload in the background so procd is not held up, and
+	# let the hotplug hook handle the case where a WAN only appears later
+	# (pppoe-wan). One data block covers every uplink.
+	if einat_fw_data; then
 		( sleep 3; logger -t einat "reloading firewall so the nat/accept overrides are picked up"; fw4 -q reload ) &
-		# ... and then prove that what we just told fw4 to stop doing is
-		# actually being done by einat. See einat_verify.
-		( einat_verify "$ifname" "$verify_timeout" ) &
+		for dev in $EINAT_DEVS; do
+			( einat_verify "$dev" "$verify_timeout" ) &
+		done
 	fi
 }
 

@@ -66,8 +66,14 @@ einat_is_wan() {
 	[ -n "$w" ] && [ "$INTERFACE" = "$w" ] && return 0
 
 	# 3. the configured section names, and the conventional ones: these do not
-	#    depend on a default route existing yet
+	#    depend on a default route existing yet. Multi-WAN: wan, wan2, wan3...
 	for w in "$(uci -q get network.wan.interface)" wan; do
+		[ -n "$w" ] && [ "$INTERFACE" = "$w" ] && return 0
+	done
+	case "$INTERFACE" in
+	wan | wan[0-9]*) return 0 ;;
+	esac
+	for w in $(uci -q get einat.@config[0].wans 2>/dev/null); do
 		[ -n "$w" ] && [ "$INTERFACE" = "$w" ] && return 0
 	done
 	if [ "$EINAT_NAT66" = "1" ]; then
