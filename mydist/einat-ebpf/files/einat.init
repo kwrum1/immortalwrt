@@ -358,13 +358,27 @@ einat_instance() {
 # fw4 overrides, emitted ONCE for the whole service: one ACCEPT per uplink and
 # one masquerade-off per uplink. procd data is service-scoped, so doing this
 # inside einat_instance() (once per WAN) would either duplicate or overwrite.
-einat_fw_data() {
+#
+# This has to be the `service_data()` hook, not an inline call from
+# start_service(): procd runs service_data() from _procd_close_service(), i.e.
+# after the "instances" object has been closed, which is the only point where
+# `data` can be added at the service root. Called inline (the previous
+# version), the cursor is still inside "instances", the block is parsed as an
+# instance named `data` and silently dropped ("Not starting instance
+# einat::data, command not set") -- measured on the bench 2026-10-27: fw4 kept
+# masquerading, so einat only rewrote the packets netfilter had not touched
+# (the dpd fast path). The source port changed mid-flow and every multi-WAN
+# TCP transfer died ("unable to receive cookie at server").
+#
+# service_data() is also why the `firewall` array is added directly: procd has
+# already opened the enclosing `data` object for us.
+service_data() {
 	local wandev landev
 
+	[ -n "$EINAT_DEVS" ] || return 0
 	landev="$(fw4_device "${lan_iface:-lan}")"
 	[ -n "$landev" ] || { logger -t einat "no LAN device; no firewall overrides"; return 1; }
 
-	procd_open_data
 	json_add_array firewall
 	for wandev in $EINAT_DEVS; do
 		# einat's external port range must be reachable from outside
@@ -389,7 +403,6 @@ einat_fw_data() {
 		json_close_object
 	done
 	json_close_array
-	procd_close_data
 	return 0
 }
 
@@ -459,15 +472,14 @@ start_service() {
 	done
 
 	# fw4 only reads the overrides when IT reloads, and it is started well before
-	# us (START=19 vs 60). Reload in the background so procd is not held up, and
-	# let the hotplug hook handle the case where a WAN only appears later
-	# (pppoe-wan). One data block covers every uplink.
-	if einat_fw_data; then
-		( sleep 3; logger -t einat "reloading firewall so the nat/accept overrides are picked up"; fw4 -q reload ) &
-		for dev in $EINAT_DEVS; do
-			( einat_verify "$dev" "$verify_timeout" ) &
-		done
-	fi
+	# us (START=19 vs 60). The overrides themselves come from service_data()
+	# above, which procd calls when this service definition is committed. Reload
+	# in the background so procd is not held up, and let the hotplug hook handle
+	# the case where a WAN only appears later (pppoe-wan).
+	( sleep 3; logger -t einat "reloading firewall so the nat/accept overrides are picked up"; fw4 -q reload ) &
+	for dev in $EINAT_DEVS; do
+		( einat_verify "$dev" "$verify_timeout" ) &
+	done
 }
 
 stop_service() {

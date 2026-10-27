@@ -755,7 +755,31 @@ int dpd_fastpath(struct __sk_buff *skb)
 			 * Cost: two packets per flow (the SYN and the ACK).
 			 * A flow shorter than that is never accelerated, which
 			 * is the conservative side.
+			 *
+			 * Multi-WAN: a primed packet goes BACK to the stack, so
+			 * it needs the same fwmark the first packet got -- the
+			 * mark is what selects the uplink's routing table. Every
+			 * packet is a new skb, so the mark of the first packet
+			 * does not carry over. Without this, the ACK of a TCP
+			 * handshake is routed by the main table, i.e. usually
+			 * another WAN: it leaves with that WAN's source address
+			 * and the server answers with a RST. Measured on the
+			 * bench 2026-10-27: the SYN reached the server, the
+			 * handshake never completed and iperf3 reported
+			 * "unable to receive cookie at server".
 			 */
+			if (primed < DPD_FLOW_PRIME && fval->wan) {
+				__u32 wi = fval->wan - 1;
+
+				if (wi < DPD_WAN_MAX) {
+					struct dpd_wan wp;
+
+					if (dpd_wan_get(wi, &wp) == 0 &&
+					    wp.ifindex == egress &&
+					    (wp.flags & DPD_WAN_F_UP))
+						skb->mark = wp.mark;
+				}
+			}
 			if (primed < DPD_FLOW_PRIME) {
 				fval->flags = (fval->flags & ~DPD_FLOW_PRIME_MASK) |
 					      ((primed + 1) << DPD_FLOW_PRIME_SHIFT);
