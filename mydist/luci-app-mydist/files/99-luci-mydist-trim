@@ -40,6 +40,11 @@ uci -q delete dhcp.@dnsmasq[0].server
 uci -q commit dhcp
 uci -q commit smartdns
 
+# IPv6: no invented ULA by default. A PPPoE / DHCPv6-PD uplink hands the LAN a
+# real prefix; a random ULA only hides that (and NAT66 is not used here).
+uci -q delete network.globals.ula_prefix
+uci -q commit network
+
 # Hide the dnsmasq half of the stock DHCP page: dnsmasq keeps the uci package
 # (it owns /etc/config/dhcp) but has no DNS or DHCP role here. The page guards
 # that section with hasSystemFeature(), which only looks at installed packages.

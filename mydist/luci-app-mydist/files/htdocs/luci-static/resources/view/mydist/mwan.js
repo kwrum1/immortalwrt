@@ -79,9 +79,9 @@ return view.extend({
 		var self = this;
 		var seen = {};
 
-		m = new form.Map('mydist_mwan', _('多 WAN'),
+		m = new form.Map('mydist_mwan', _('多 WAN 负载'),
 			_('按流把新建连接分配到多条 WAN，每条 WAN 仍由自己的 einat 实例做 NAT。' +
-			  '当前只有 balance（按权重）模式；已有连接在重载后重建。'));
+			  '可按带宽比例自动分配，也可手动指定权重；已有连接在重载后重建。'));
 
 		s = m.section(form.NamedSection, 'global', 'global', _('全局'));
 		s.addremove = false;
@@ -97,6 +97,13 @@ return view.extend({
 		o.rmempty = false;
 		o.placeholder = '5';
 		o.description = _('秒（1–3600）。常驻的 health 循环按这个间隔 ping 每条 WAN 的健康目标。');
+
+		o = s.option(form.ListValue, 'mode', _('负载方式'));
+		o.value('auto', _('按带宽比例自动'));
+		o.value('manual', _('手动权重'));
+		o.default = 'auto';
+		o.rmempty = false;
+		o.description = _('自动：权重 = 本 WAN 带宽 / 最小带宽（1–8）。手动：直接使用下面的“权重”。');
 
 		s = m.section(form.GridSection, 'wan', _('WAN 接口'));
 		s.anonymous = true;
@@ -153,13 +160,20 @@ return view.extend({
 
 		addIface('wan');
 
+		o = s.option(form.Value, 'bandwidth', _('带宽 (Mbit/s)'));
+		o.modalonly = false;
+		o.datatype = 'range(1,100000)';
+		o.placeholder = '100';
+		o.rmempty = true;
+		o.description = _('这条 WAN 的下行带宽，仅“自动”模式使用。');
+
 		o = s.option(form.Value, 'weight', _('权重'));
 		o.modalonly = false;
 		o.datatype = 'range(1,8)';
 		o.default = '1';
 		o.rmempty = false;
 		o.placeholder = '1';
-		o.description = _('1–8。新流按权重比例选路（1:1 平分，2:1 约为 2/3 与 1/3）。');
+		o.description = _('1–8，仅“手动”模式使用。新流按权重比例选路（1:1 平分，2:1 约为 2/3 与 1/3）。');
 
 		o = s.option(form.Flag, 'enabled', _('启用'));
 		o.modalonly = false;

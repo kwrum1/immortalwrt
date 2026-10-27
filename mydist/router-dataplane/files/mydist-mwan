@@ -81,11 +81,33 @@ reconcile() {
 	# tear down anything we set up before
 	cleanup_rules
 
+	# auto mode: the effective weight is the bandwidth ratio, normalised to the
+	# slowest uplink (1..8, matching the dpd_wans weight field). manual mode uses
+	# the configured weight unchanged.
+	local mode minbw=0 bw
+	mode=$(uci_get global.mode); mode=${mode:-auto}
+	if [ "$mode" = "auto" ]; then
+		for sid in $(wan_ifaces); do
+			[ "$(uci_get "$sid.enabled")" = "0" ] && continue
+			bw=$(uci_get "$sid.bandwidth"); bw=${bw:-0}
+			[ "$bw" -gt 0 ] 2>/dev/null || continue
+			if [ "$minbw" -eq 0 ] || [ "$bw" -lt "$minbw" ]; then
+				minbw=$bw
+			fi
+		done
+	fi
+
 	for sid in $(wan_ifaces); do
 		[ "$(uci_get "$sid.enabled")" = "0" ] && continue
 		local ifn weight health dev gw mac gwmac flags l3
 		ifn=$(uci_get "$sid.interface")
 		weight=$(uci_get "$sid.weight"); weight=${weight:-1}
+		if [ "$mode" = "auto" ] && [ "$minbw" -gt 0 ] 2>/dev/null; then
+			bw=$(uci_get "$sid.bandwidth"); bw=${bw:-$minbw}
+			weight=$(( (bw + minbw / 2) / minbw ))
+			[ "$weight" -lt 1 ] && weight=1
+			[ "$weight" -gt 8 ] && weight=8
+		fi
 		health=$(uci_get "$sid.health")
 		dev=$(dev_info "$ifn") || { log "$sid($ifn): down"; continue; }
 		gw=$(wan_gw "$ifn")
