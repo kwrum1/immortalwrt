@@ -58,5 +58,22 @@ fi
 /etc/init.d/smartdns restart >/dev/null 2>&1
 /etc/init.d/firewall reload >/dev/null 2>&1
 
-logger -t mydist "luci: firewall posture open + rule 999 on; SmartDNS owns :53"
+# --- QoS: on, with no knobs -------------------------------------------------
+# router-qos used to take an upload rate plus five CAKE parameters. It now runs
+# unlimited with one maintained policy (see /usr/libexec/router-qos.sh), so drop
+# the settings older images carried and make sure it is on.
+if [ -f /etc/config/router_qos ]; then
+	uci -q delete router_qos.global.upload
+	uci -q delete router_qos.global.overhead
+	uci -q delete router_qos.global.mpu
+	uci -q delete router_qos.global.diffserv
+	uci -q delete router_qos.global.wash
+	uci -q delete router_qos.global.nat
+	uci -q set router_qos.global.enabled='1'
+	uci -q commit router_qos
+fi
+rm -f /www/luci-static/resources/view/mydist/qos.js 2>/dev/null
+/etc/init.d/router-qos restart >/dev/null 2>&1
+
+logger -t mydist "luci: firewall posture open + rule 999 on; SmartDNS owns :53; QoS on (no knobs)"
 exit 0

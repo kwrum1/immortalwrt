@@ -49,11 +49,11 @@ CI 只对 **X86 / ROCKCHIP** 使用这个分支；IPQ / MTK 仍构建上游的 `
 | **einat-ebpf** | `EHfive/einat-ebpf` v0.1.11，上游 release 的静态 musl 二进制（x86_64 / aarch64） | TC 上的 **Full Cone NAT44**（EIM + EIF），不依赖 conntrack | `fw4` 的 `MASQUERADE`（conntrack + 端口受限映射） | 外网可主动回连；NAT 状态对 eBPF 可见；端口段 `20000-29999`；支持 hairpin |
 | **router-dataplane**（`dpd-fastpath`） | 本仓库 `src/dpd_fastpath.bpf.c` + `dpdctl.c`，构建期用 host clang 编 BPF | TC **ingress** 快路径：已建立连接的转发走 `bpf_fib_lookup` 直接重定向 | “每个包都过 netfilter 规则链”的路径 | **不做 NAT**、**不共享 einat 的 map/ABI**、**不做 conntrack**；只挂 classic `cls_bpf`（不能改 TCX，否则会抢 honk 的代理流） |
 | **router-acl** | 本仓库 `src/acl.bpf.c` + `aclctl.c` | WAN 侧 eBPF ACL：挡住无主入站；`bypass` 模式加 mark + `notrack`，把 NAT 流逃离 conntrack | 叠加在 fw4 之上的策略层（fw4 仍兜底） | 比 stock 更严；`mode=guard` 默认开；`import_firewall=1` 同步端口转发 |
-| **router-qos** | 本仓库，纯脚本 | WAN 上一条 `root cake`，按上行整形；`triple-isolate` 逐主机公平、`diffserv4` 分档 | 默认 `fq_codel` / 无整形 | 只做上传方向（下载需要 IFB，实测会破坏 ACL/dpd 的 hook 顺序） |
+| **router-qos** | 本仓库，纯脚本 | WAN 上一条 `root cake`，**无限速**（只做逐流公平与 AQM）：`triple-isolate` 逐主机公平、`diffserv4` 分档、`nat` 记账；无 UI、无速率参数、默认开启，无 cake 时自动回退 `fq_codel` | 默认 `fq_codel` / 无整形 | 只做上传方向（下载需要 IFB，实测会破坏 ACL/dpd 的 hook 顺序）；多 WAN 时自动覆盖所有参与负载的链路 |
 | **router-tuning** | 本仓库，纯脚本 | 首启按 CPU/内存/网卡选档：BBR、`fq`、sysctl、ring/coalescing、XPS、governor | 不替换 qdisc；只调内核与网卡参数 | 所有写入都在**运行期**，不动 `/etc/config/{network,dhcp,firewall}` |
 | **router-dns** | 本仓库，纯脚本 | **SmartDNS 独占 :53**；dnsmasq 端口 0 并停用；`router-dns-sync` 把 DHCP 学到的真实上游（非本机）写成 `server` 段，DoT 作为并行上游；`/tmp/resolv.conf` → `127.0.0.1`；`.lan` 名字写进 `hosts.lan`；honk 的 DNS 交接 | 替换 dnsmasq 的解析角色 | dnsmasq 只保留二进制，不再监听；上游**从租约派生**而不是写死，自身地址一律过滤 |
 | **luci-front** | 本仓库；Rust + pingora 0.9，静态 musl，预编译（x86_64 / aarch64） | :80/:443：HTTP/2、TLS、HSTS/CSP/X-Frame-Options/X-Content-Type-Options、静态 ETag/304；`/cgi-bin`、`/ubus` 反代 uhttpd | 替换 uhttpd 的对外监听 | uhttpd 退到 `127.0.0.1:8080`，只保留 Lua CGI 与 ubus 桥 |
-| **luci-app-mydist** | 本仓库 | 菜单（DNS/代理/防火墙/QoS/多 WAN）、五元组端口控制（单行表格）、QoS 页、多 WAN 配置与状态页、`mydist-posture` | 替换原版 firewall/smartdns/honk 菜单入口 | `rule 999` 默认开启且不在 UI 显示；保存端口行时自动补 `src=wan/dest=lan/target=DNAT` 并丢弃未填完的行；多 WAN 用法见 [`docs/multi-wan.md`](docs/multi-wan.md) |
+| **luci-app-mydist** | 本仓库 | 菜单（DNS/代理/防火墙/多 WAN 负载）、五元组端口控制（单行表格）、多 WAN 负载页、`mydist-posture` | 替换原版 firewall/smartdns/honk 菜单入口 | `rule 999` 默认开启且不在 UI 显示；保存端口行时自动补 `src=wan/dest=lan/target=DNAT` 并丢弃未填完的行 |
 
 ---
 
