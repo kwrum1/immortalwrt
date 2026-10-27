@@ -9,7 +9,7 @@
   WAN 侧下载钩子；`/etc/init.d/mydist-mwan` 是它的 procd 服务（S61）。
 
 当前只有 **balance（按权重）** 模式，没有主备/failover 切换，也**不支持 IPv6**。
-页面在 **网络 → 多 WAN**（`admin/network/mwan`）。
+页面在 **网络 → 多 WAN 负载**（`admin/network/mwan`）。
 
 > 状态：实验台（x86_64，内核 6.18.55，两条以太网 WAN）已验收；
 > 家用双 PPPoE 实链路尚未实测，见文末“未验证 / 已知问题”。
@@ -72,23 +72,31 @@ config interface 'wan2'
 
 ### 3.1 LuCI
 
-**网络 → 多 WAN**：
+**网络 → 多 WAN 负载**：
 
-1. 打开“启用多 WAN”，健康检查间隔一般保持 `5` 秒；
-2. 在“WAN 接口”表里添加行：
-   - **WAN 接口**：下拉选择 netifd 接口（`wan`、`wan2`……），也可以直接输入；
-   - **权重**：1–8，默认 1；
+1. 打开“启用多 WAN”，健康检查间隔一般保持 `5` 秒，选择负载方式
+   （**按带宽比例自动** 或 **手动权重**）；
+2. 点“**添加接口**”：直接多出一行，不弹确认框。新行在选好接口之前不生效；
+3. 点该行的“**编辑**”：
+   - **WAN 接口**：下拉选择 netifd 接口（`wan`、`wan2`、`pppoe-wan`……）。
+     表格里的接口列是**锁定**的，只能在编辑里改；
+   - **带宽 (Mbit/s)**：自动模式用它算权重（权重 = 本 WAN 带宽 / 最小带宽，
+     夹在 1–8）；手动模式忽略；
+   - **权重**：1–8，手动模式使用；
    - **启用**：单条 WAN 的开关；
    - **健康目标**：留空用该 WAN 的网关；PPPoE 接口没有默认网关时 daemon
      会退回 `1.1.1.1`，所以双 PPPoE 建议显式填写一个从这条线能 ping 通的
      公网地址；
-   - **状态**：只读，显示 `up/down`、设备名和该设备的累计 RX/TX 字节。
-3. 保存。页面会执行 `uci commit mydist_mwan`，然后
-   `/etc/init.d/mydist-mwan restart`（关闭总开关时执行 `stop`）。
-   服务重跑 reconcile，已有连接会重建。
+4. 编辑弹窗里的“保存”会写 `uci commit mydist_mwan`，然后
+   `/etc/init.d/mydist-mwan restart`（关闭总开关时执行 `stop`）。服务重跑
+   reconcile，已有连接会重建。
+
+表格里的“状态”是只读的：显示 `up/down`、设备名、**当前生效权重**（自动模式
+换算后的值）以及该设备的累计 RX/TX 字节。
 
 权重是**新流**的比例，不是带宽上限：`wan=2, wan2=1` 表示新流约 2/3 走
-`wan`、1/3 走 `wan2`。要限速请用 **网络 → QoS**（只整形上传）或上游设备。
+`wan`、1/3 走 `wan2`。要限速请用上游设备；本机的 QoS 没有页面，默认开启，
+只做逐流公平与 AQM，不按速率整形。
 
 ### 3.2 UCI
 
@@ -207,8 +215,9 @@ nft 逐包处理，不是选路。
 
 ### 5.2 需要逐包限速/整形时关掉 downlink
 
-- QoS 页面只做**上传**方向的 CAKE（`root cake`），它看到的是 WAN egress，
-  和 dpd 不冲突；
+- QoS 只做**上传**方向的 qdisc（默认 `cake`，多千兆链路自动换 `fq_codel`），
+  它看到的是 WAN egress，和 dpd 不冲突；它没有页面，默认开启，也不按速率
+  整形（只做逐流公平与 AQM）；
 - 下载方向如果要按主机/按包整形，需要 IFB 或 ingress qdisc。dpd 在 WAN
   ingress 上装了 downlink 钩子，把已识别的包直接 redirect 到 LAN，这些包
   不会再经过 IFB/ingress 整形；强行加 IFB 还会和 router-acl/dpd 抢包。

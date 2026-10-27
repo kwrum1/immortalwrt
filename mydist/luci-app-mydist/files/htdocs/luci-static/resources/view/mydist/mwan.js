@@ -1,21 +1,27 @@
 'use strict';
 'require view';
-'require form';
 'require uci';
 'require fs';
 'require rpc';
+'require ui';
 
-/* Network -> 多 WAN: per-flow load balancing across the uplinks that
- * mydist-mwan already owns (routing tables, fwmark rules, dpd_wans, einat).
+/* Network -> 多 WAN 负载: per-flow load balancing across the uplinks that
+ * mydist-mwan owns (routing tables, fwmark rules, dpd_wans, einat).
  *
- * This page only edits /etc/config/mydist_mwan. The dataplane is untouched:
- * saving restarts mydist-mwan (or stops it when the global switch is off), and
- * reconcile rewrites the tables, rules and the dpd_wans map from the new file.
+ * Layout rules for this page:
+ *   - the table is the list of uplinks; the WAN interface column is read-only
+ *     there, because picking an interface is the one choice that changes which
+ *     einat instance / routing table a row owns. It is only editable in the
+ *     edit dialog.
+ *   - "+ 添加接口" appends a row immediately: creating a row is not destructive,
+ *     and asking for confirmation before an empty row exists is just friction.
+ *     The row stays inactive until an interface is chosen in the dialog.
+ *   - every change is written with uci and applied right away (commit, then
+ *     restart mydist-mwan). There is no page-level Save that can be forgotten.
  *
  * Status comes from /var/run/mydist-mwan/wans (one line per reconciled uplink:
  * ifn dev mark table pref weight target flags p1 p2, flags bit 0 = up) and
- * from netifd's device statistics. Counters are cumulative since boot, not a
- * rate: this page is a configuration page, not a realtime monitor.
+ * from netifd's device statistics.
  */
 
 var callInterfaces = rpc.declare({
@@ -44,6 +50,16 @@ function fmtBytes(n) {
 	return (i ? n.toFixed(1) : String(n)) + ' ' + unit[i];
 }
 
+function uciRun(args) {
+	return fs.exec('/sbin/uci', args).then(function(res) {
+		if (res.code != 0)
+			throw new Error(((res.stderr || '') + (res.stdout || '')).trim() ||
+				'uci ' + args.join(' '));
+
+		return res;
+	});
+}
+
 return view.extend({
 	load: function() {
 		var self = this;
@@ -61,76 +77,40 @@ return view.extend({
 		]).then(function(res) {
 			self.ifaces = res[2] || [];
 			self.devstats = res[3] || {};
-
-			(res[4] || '').split('\n').forEach(function(line) {
-				var f = line.trim().split(/\s+/);
-
-				if (f.length >= 8)
-					self.runtime[f[0]] = {
-						dev: f[1],
-						weight: parseInt(f[5], 10) || 0,
-						flags: parseInt(f[7], 10) || 0
-					};
-			});
+			self.parseRuntime(res[4] || '');
 		});
 	},
 
-	render: function() {
-		var m, s, o;
+	parseRuntime: function(text) {
 		var self = this;
-		var seen = {};
 
-		m = new form.Map('mydist_mwan', _('多 WAN 负载'),
-			_('按流把新建连接分配到多条 WAN，每条 WAN 仍由自己的 einat 实例做 NAT。' +
-			  '可按带宽比例自动分配，也可手动指定权重；已有连接在重载后重建。'));
+		self.runtime = {};
 
-		s = m.section(form.NamedSection, 'global', 'global', _('全局'));
-		s.addremove = false;
+		text.split('\n').forEach(function(line) {
+			var f = line.trim().split(/\s+/);
 
-		o = s.option(form.Flag, 'enabled', _('启用多 WAN'));
-		o.default = '0';
-		o.rmempty = false;
-		o.description = _('关闭后恢复单 WAN 行为：清掉 fwmark 规则和 dpd_wans 表。');
+			if (f.length >= 8)
+				self.runtime[f[0]] = {
+					dev: f[1],
+					weight: parseInt(f[5], 10) || 0,
+					flags: parseInt(f[7], 10) || 0
+				};
+		});
+	},
 
-		o = s.option(form.Value, 'health_interval', _('健康检查间隔'));
-		o.datatype = 'range(1,3600)';
-		o.default = '5';
-		o.rmempty = false;
-		o.placeholder = '5';
-		o.description = _('秒（1–3600）。常驻的 health 循环按这个间隔 ping 每条 WAN 的健康目标。');
+	ifaceChoices: function() {
+		var seen = {}, out = [];
 
-		o = s.option(form.ListValue, 'mode', _('负载方式'));
-		o.value('auto', _('按带宽比例自动'));
-		o.value('manual', _('手动权重'));
-		o.default = 'auto';
-		o.rmempty = false;
-		o.description = _('自动：权重 = 本 WAN 带宽 / 最小带宽（1–8）。手动：直接使用下面的“权重”。');
-
-		s = m.section(form.GridSection, 'wan', _('WAN 接口'));
-		s.anonymous = true;
-		s.addremove = true;
-		s.sortable = false;
-		s.nodescriptions = true;
-		s.sectiontitle = function(sid) {
-			return uci.get('mydist_mwan', sid, 'interface') || _('新 WAN');
-		};
-
-		o = s.option(form.ListValue, 'interface', _('WAN 接口'));
-		o.modalonly = false;
-		o.rmempty = false;
-		o.editable = true;
-		o.placeholder = 'wan';
-
-		function addIface(name, label) {
+		function add(name, label) {
 			if (!name || seen[name])
 				return;
 
 			seen[name] = true;
-			o.value(name, label || name);
+			out.push({ value: name, label: label || name });
 		}
 
-		/* netifd first: this is the authoritative logical name and gives us
-		 * the l3_device (pppoe-wan, eth1, ...) as a hint. */
+		/* netifd first: the authoritative logical name, with the l3_device
+		 * (pppoe-wan, eth1, ...) as a hint. */
 		(this.ifaces || []).forEach(function(iface) {
 			if (iface.interface == 'loopback')
 				return;
@@ -143,96 +123,387 @@ return view.extend({
 			if (iface.up === false)
 				label += ' · ' + _('未连接');
 
-			addIface(iface.interface, label);
+			add(iface.interface, label);
 		});
 
 		/* Fall back to /etc/config/network so a WAN that netifd has not
-		 * brought up yet can still be configured. */
+		 * brought up yet can still be selected. */
 		uci.sections('network', 'interface', function(sec) {
 			if (sec['.name'] != 'loopback')
-				addIface(sec['.name']);
+				add(sec['.name']);
 		});
 
-		/* Values already in mydist_mwan must survive even if netifd and
-		 * network no longer know about them (for example a removed WAN). */
+		/* Keep interfaces already in mydist_mwan selectable. */
 		uci.sections('mydist_mwan', 'wan', function(sec) {
-			addIface(sec.interface);
+			add(sec.interface);
 		});
 
-		addIface('wan');
+		add('wan');
 
-		o = s.option(form.Value, 'bandwidth', _('带宽 (Mbit/s)'));
-		o.modalonly = false;
-		o.datatype = 'range(1,100000)';
-		o.placeholder = '100';
-		o.rmempty = true;
-		o.description = _('这条 WAN 的下行带宽，仅“自动”模式使用。');
+		return out;
+	},
 
-		o = s.option(form.Value, 'weight', _('权重'));
-		o.modalonly = false;
-		o.datatype = 'range(1,8)';
-		o.default = '1';
-		o.rmempty = false;
-		o.placeholder = '1';
-		o.description = _('1–8，仅“手动”模式使用。新流按权重比例选路（1:1 平分，2:1 约为 2/3 与 1/3）。');
+	row: function(title, control, desc) {
+		return E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title' }, [ title ]),
+			E('div', { 'class': 'cbi-value-field' }, [
+				control,
+				desc ? E('div', { 'class': 'cbi-value-description' }, [ desc ]) : ''
+			])
+		]);
+	},
 
-		o = s.option(form.Flag, 'enabled', _('启用'));
-		o.modalonly = false;
-		o.default = o.enabled;
-		o.rmempty = false;
+	render: function() {
+		var self = this;
 
-		o = s.option(form.Value, 'health', _('健康目标'));
-		o.modalonly = false;
-		o.datatype = 'host';
-		o.rmempty = true;
-		o.placeholder = _('缺省用网关');
-		o.description = _('从这条 WAN 的接口 ping 的地址；留空则用 netifd 报告的网关。');
+		self.gEnable = E('input', { type: 'checkbox' });
+		self.gEnable.checked = uci.get('mydist_mwan', 'global', 'enabled') == '1';
 
-		o = s.option(form.DummyValue, 'status', _('状态'));
-		o.modalonly = false;
-		o.cfgvalue = function(sid) {
-			var ifn = uci.get('mydist_mwan', sid, 'interface');
-			var rt = self.runtime[ifn];
+		self.gInterval = E('input', {
+			'class': 'cbi-input-text', type: 'number',
+			min: '1', max: '3600',
+			value: uci.get('mydist_mwan', 'global', 'health_interval') || '5'
+		});
 
-			if (!rt)
-				return _('未就绪（服务未运行或该 WAN 还没有可用网关）');
+		self.gMode = E('select', { 'class': 'cbi-input-select' }, [
+			E('option', { value: 'auto' }, [ _('按带宽比例自动') ]),
+			E('option', { value: 'manual' }, [ _('手动权重') ])
+		]);
+		self.gMode.value = uci.get('mydist_mwan', 'global', 'mode') || 'auto';
 
-			var dev = rt.dev;
-			var txt = ((rt.flags & 1) ? _('up') : _('down')) + ' · ' + dev +
+		self.tbody = E('tbody');
+
+		var table = E('table', { 'class': 'table' }, [
+			E('thead', {}, [
+				E('tr', { 'class': 'tr table-titles' }, [
+					E('th', { 'class': 'th' }, [ _('WAN 接口') ]),
+					E('th', { 'class': 'th' }, [ _('带宽 (Mbit/s)') ]),
+					E('th', { 'class': 'th' }, [ _('权重') ]),
+					E('th', { 'class': 'th' }, [ _('启用') ]),
+					E('th', { 'class': 'th' }, [ _('状态') ]),
+					E('th', { 'class': 'th' }, [ _('操作') ])
+				])
+			]),
+			self.tbody
+		]);
+
+		self.renderRows();
+
+		return E('div', { 'class': 'cbi-map' }, [
+			E('h2', {}, [ _('多 WAN 负载') ]),
+			E('div', { 'class': 'cbi-map-descr' }, [
+				_('按流把新建连接分配到多条 WAN，每条 WAN 仍由自己的 einat 实例做 NAT。' +
+				  '可按带宽比例自动分配，也可手动指定权重；已有连接在重载后重建。')
+			]),
+
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ _('全局') ]),
+
+				self.row(_('启用多 WAN'), self.gEnable,
+					_('关闭后恢复单 WAN 行为：清掉 fwmark 规则和 dpd_wans 表。')),
+
+				self.row(_('健康检查间隔'), self.gInterval,
+					_('秒（1–3600）。常驻的 health 循环按这个间隔 ping 每条 WAN 的健康目标。')),
+
+				self.row(_('负载方式'), self.gMode,
+					_('自动：权重 = 本 WAN 带宽 / 最小带宽（1–8）。手动：直接使用每条 WAN 的“权重”。')),
+
+				E('div', { 'class': 'cbi-page-actions' }, [
+					E('button', {
+						'class': 'btn cbi-button cbi-button-apply',
+						click: function() { return self.saveGlobal(); }
+					}, [ _('保存并应用') ])
+				])
+			]),
+
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ _('WAN 接口') ]),
+				table,
+				E('div', { 'class': 'cbi-section-create' }, [
+					E('button', {
+						'class': 'cbi-button cbi-button-add',
+						click: function() { return self.addUplink(); }
+					}, [ _('添加接口') ])
+				]),
+				E('div', { 'class': 'cbi-value-description' }, [
+					_('接口在表格里是锁定的，点“编辑”才能选择。新加的行在选好接口之前不会生效。')
+				])
+			])
+		]);
+	},
+
+	devOf: function(ifn) {
+		var dev = '';
+
+		(this.ifaces || []).forEach(function(iface) {
+			if (iface.interface == ifn)
+				dev = iface.l3_device || iface.device || '';
+		});
+
+		return dev;
+	},
+
+	renderRows: function() {
+		var self = this;
+		var any = false;
+
+		while (self.tbody.firstChild)
+			self.tbody.removeChild(self.tbody.firstChild);
+
+		uci.sections('mydist_mwan', 'wan', function(sec) {
+			any = true;
+			self.tbody.appendChild(self.renderRow(sec));
+		});
+
+		if (!any)
+			self.tbody.appendChild(E('tr', { 'class': 'tr' }, [
+				E('td', { 'class': 'td', colspan: 6 }, [
+					E('em', {}, [ _('还没有接口，点“添加接口”。') ])
+				])
+			]));
+	},
+
+	renderRow: function(sec) {
+		var self = this;
+		var sid = sec['.name'];
+		var ifn = sec.interface || '';
+		var on = sec.enabled != '0';
+		var rt = ifn ? self.runtime[ifn] : null;
+		var dev = (rt && rt.dev) || self.devOf(ifn);
+		var label = ifn || _('未选择');
+
+		if (ifn && dev && dev != ifn)
+			label += ' (' + dev + ')';
+
+		var status;
+
+		if (!ifn)
+			status = _('等待选择接口');
+		else if (!on)
+			status = _('已停用');
+		else if (!rt)
+			status = _('未就绪（服务未运行或该 WAN 还没有可用网关）');
+		else {
+			status = ((rt.flags & 1) ? _('up') : _('down')) + ' · ' + rt.dev +
 				' · ' + _('生效权重') + ' ' + rt.weight;
-			var stats = (self.devstats[dev] || {}).statistics;
+
+			var stats = (self.devstats[rt.dev] || {}).statistics;
 
 			if (stats)
-				txt += ' · RX ' + fmtBytes(stats.rx_bytes) +
-				       ' / TX ' + fmtBytes(stats.tx_bytes);
+				status += ' · RX ' + fmtBytes(stats.rx_bytes) +
+					' / TX ' + fmtBytes(stats.tx_bytes);
+		}
 
-			return txt;
-		};
+		return E('tr', { 'class': 'tr' }, [
+			E('td', { 'class': 'td' }, [
+				ifn ? label : E('em', { style: 'color:#c44' }, [ label ])
+			]),
+			E('td', { 'class': 'td' }, [ sec.bandwidth || '—' ]),
+			E('td', { 'class': 'td' }, [ sec.weight || '1' ]),
+			E('td', { 'class': 'td' }, [ on ? '✓' : '✗' ]),
+			E('td', { 'class': 'td' }, [ status ]),
+			E('td', { 'class': 'td' }, [
+				E('button', {
+					'class': 'btn cbi-button cbi-button-edit',
+					click: function() { return self.editUplink(sid); }
+				}, [ _('编辑') ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button cbi-button-remove',
+					click: function() { return self.removeUplink(sid); }
+				}, [ _('删除') ])
+			])
+		]);
+	},
 
-		var save = m.save.bind(m);
+	applyChanges: function(cmds, opts) {
+		var self = this;
+		var p = Promise.resolve();
 
-		m.save = function(cb, silent) {
-			return save(cb, silent).then(function() {
-				/* Add/Remove in the grid save silently; restarting the
-				 * service on every intermediate click would drop flows for
-				 * no reason. Only a real Save applies the config. */
-				if (silent)
+		opts = opts || {};
+
+		(cmds || []).forEach(function(args) {
+			p = p.then(function() { return uciRun(args); });
+		});
+
+		return p
+			.then(function() { return uciRun([ 'commit', 'mydist_mwan' ]); })
+			.then(function() {
+				if (opts.restart === false)
 					return;
 
-				return fs.exec('/sbin/uci', [ 'commit', 'mydist_mwan' ])
-					.catch(function() {})
-					.then(function() {
-						var on = uci.get('mydist_mwan', 'global', 'enabled') == '1';
-
-						/* restart, not reload: enabling the feature after it
-						 * was stopped has to start the health loop as well,
-						 * and disabling has to run cleanup. */
-						return fs.exec('/etc/init.d/mydist-mwan',
-							[ on ? 'restart' : 'stop' ]).catch(function() {});
-					});
+				/* restart, not reload: enabling after it was stopped has to
+				 * start the health loop, disabling has to clean the rules. */
+				return fs.exec('/bin/sh', [ '-c',
+					'[ "$(uci -q get mydist_mwan.global.enabled)" = "1" ] && ' +
+					'exec /etc/init.d/mydist-mwan restart || ' +
+					'exec /etc/init.d/mydist-mwan stop'
+				]).catch(function() {});
+			})
+			.then(function() { return self.reload(); })
+			.then(function() {
+				if (opts.closeModal)
+					ui.hideModal();
+				if (opts.notify)
+					ui.addNotification(null, E('p', {}, [ opts.notify ]), 'info');
+			})
+			.catch(function(e) {
+				ui.addNotification(null, E('p', {}, [ e.message || String(e) ]), 'danger');
 			});
-		};
+	},
 
-		return m.render();
+	reload: function() {
+		var self = this;
+
+		uci.unload([ 'mydist_mwan' ]);
+
+		return uci.load('mydist_mwan').then(function() {
+			return fs.read('/var/run/mydist-mwan/wans').catch(function() { return ''; });
+		}).then(function(text) {
+			self.parseRuntime(text || '');
+			self.renderRows();
+		});
+	},
+
+	saveGlobal: function() {
+		var self = this;
+		var iv = String(self.gInterval.value).trim();
+
+		if (!/^[0-9]+$/.test(iv) || parseInt(iv, 10) < 1 || parseInt(iv, 10) > 3600)
+			return ui.addNotification(null, E('p', {}, [
+				_('健康检查间隔必须是 1–3600 的整数秒')
+			]), 'danger');
+
+		return self.applyChanges([
+			[ 'set', 'mydist_mwan', 'global', 'enabled', self.gEnable.checked ? '1' : '0' ],
+			[ 'set', 'mydist_mwan', 'global', 'health_interval', String(parseInt(iv, 10)) ],
+			[ 'set', 'mydist_mwan', 'global', 'mode', self.gMode.value ]
+		], { notify: _('已保存并应用') });
+	},
+
+	addUplink: function() {
+		var self = this;
+		var used = {}, n = 1, name;
+
+		uci.sections('mydist_mwan', 'wan', function(sec) {
+			used[sec['.name']] = true;
+		});
+
+		do {
+			name = (n == 1) ? 'wan' : 'wan' + n;
+			n++;
+		} while (used[name]);
+
+		/* No dialog: the row appears at once and is inactive until an
+		 * interface is chosen here. Nothing to restart yet. */
+		return self.applyChanges([
+			[ 'set', 'mydist_mwan', name, 'wan' ],
+			[ 'set', 'mydist_mwan', name, 'enabled', '1' ],
+			[ 'set', 'mydist_mwan', name, 'weight', '1' ]
+		], { restart: false, notify: _('已添加接口行，点“编辑”选择 WAN 接口') });
+	},
+
+	removeUplink: function(sid) {
+		var self = this;
+		var ifn = uci.get('mydist_mwan', sid, 'interface') || sid;
+
+		ui.showModal(_('删除接口'), [
+			E('p', {}, [ _('把 “%s” 从负载均衡里删除？').format(ifn) ]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn cbi-button', click: function() { ui.hideModal(); } }, [ _('取消') ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button cbi-button-negative important',
+					click: function() {
+						return self.applyChanges([
+							[ 'delete', 'mydist_mwan', sid ]
+						], { closeModal: true, notify: _('已删除') });
+					}
+				}, [ _('删除') ])
+			])
+		], 'cbi-modal');
+	},
+
+	editUplink: function(sid) {
+		var self = this;
+		var cur = uci.get('mydist_mwan', sid, 'interface') || '';
+
+		var sel = E('select', { 'class': 'cbi-input-select' });
+
+		self.ifaceChoices().forEach(function(c) {
+			sel.appendChild(E('option', { value: c.value }, [ c.label ]));
+		});
+		sel.value = cur;
+
+		var bw = E('input', {
+			'class': 'cbi-input-text', type: 'number',
+			min: '1', max: '100000', placeholder: '100',
+			value: uci.get('mydist_mwan', sid, 'bandwidth') || ''
+		});
+
+		var wt = E('input', {
+			'class': 'cbi-input-text', type: 'number',
+			min: '1', max: '8', placeholder: '1',
+			value: uci.get('mydist_mwan', sid, 'weight') || '1'
+		});
+
+		var on = E('input', { type: 'checkbox' });
+		on.checked = uci.get('mydist_mwan', sid, 'enabled') != '0';
+
+		var hl = E('input', {
+			'class': 'cbi-input-text',
+			placeholder: _('缺省用网关'),
+			value: uci.get('mydist_mwan', sid, 'health') || ''
+		});
+
+		function save() {
+			var ifn = sel.value;
+			var b = String(bw.value).trim();
+			var w = String(wt.value).trim();
+			var h = String(hl.value).trim();
+			var cmds;
+
+			if (!ifn)
+				return ui.addNotification(null, E('p', {}, [ _('请选择 WAN 接口') ]), 'danger');
+			if (!/^[1-8]$/.test(w))
+				return ui.addNotification(null, E('p', {}, [ _('权重必须是 1–8 的整数') ]), 'danger');
+			if (b !== '' && (!/^[0-9]+$/.test(b) || parseInt(b, 10) < 1 || parseInt(b, 10) > 100000))
+				return ui.addNotification(null, E('p', {}, [ _('带宽必须是 1–100000 的整数（Mbit/s），或留空') ]), 'danger');
+			if (h !== '' && !/^[0-9A-Za-z._:-]+$/.test(h))
+				return ui.addNotification(null, E('p', {}, [ _('健康目标只能是 IP 或主机名') ]), 'danger');
+
+			cmds = [
+				[ 'set', 'mydist_mwan', sid, 'interface', ifn ],
+				[ 'set', 'mydist_mwan', sid, 'enabled', on.checked ? '1' : '0' ],
+				[ 'set', 'mydist_mwan', sid, 'weight', String(parseInt(w, 10)) ],
+				b === '' ? [ 'delete', 'mydist_mwan', sid, 'bandwidth' ]
+				         : [ 'set', 'mydist_mwan', sid, 'bandwidth', b ],
+				h === '' ? [ 'delete', 'mydist_mwan', sid, 'health' ]
+				         : [ 'set', 'mydist_mwan', sid, 'health', h ]
+			];
+
+			return self.applyChanges(cmds, { closeModal: true, notify: _('已保存并应用') });
+		}
+
+		ui.showModal(_('编辑接口'), [
+			self.row(_('WAN 接口'), sel,
+				_('逻辑接口（wan / wan2 / pppoe-wan …）。只能在编辑里选择。')),
+			self.row(_('带宽 (Mbit/s)'), bw,
+				_('“按带宽比例自动”时使用；手动模式忽略。')),
+			self.row(_('权重'), wt,
+				_('1–8，仅“手动权重”模式使用。')),
+			self.row(_('启用'), on,
+				_('关闭后这条 WAN 不参与负载均衡。')),
+			self.row(_('健康目标'), hl,
+				_('从这条 WAN 发 ping 的地址；留空则用 netifd 报告的网关。')),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn cbi-button', click: function() { ui.hideModal(); } }, [ _('取消') ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button cbi-button-positive important',
+					click: save
+				}, [ _('保存') ])
+			])
+		], 'cbi-modal');
 	}
 });
