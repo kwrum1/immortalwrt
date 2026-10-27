@@ -157,6 +157,16 @@ reconcile() {
 	else
 		log "dpd_wans map not pinned (is dpd attached?)"
 	fi
+
+	# Put the uplink (downlink) hooks back. einat's restart deletes the classic
+	# filters on its netdev and nothing re-adds them until the next ifup, so a
+	# reconcile has to do it: that is the documented contract ("restart einat,
+	# then reconcile mwan"). Guarded by the pinned config map because at boot
+	# this runs (S61) before dpd loads (S95) -- there is nothing to refresh yet
+	# and dpd's own start attaches every uplink afterwards.
+	if [ -e /sys/fs/bpf/tc/globals/dpd_cfg ] && [ -x /usr/libexec/dpd-gate-refresh ]; then
+		/usr/libexec/dpd-gate-refresh >/dev/null 2>&1
+	fi
 }
 
 cleanup_rules() {

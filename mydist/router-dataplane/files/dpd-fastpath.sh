@@ -312,6 +312,29 @@ dpd_gate_refresh_uci() {
 # program start taking the rest of that flow over. Measured on the lab bench
 # (2026-10-27, 2 vCPU x86_64, -P4 iperf3 download): 2.72 -> 3.44 Gbit/s, router
 # CPU 61% -> 65% (total), and the L2 emit path another +16% on top of that.
+# Every device that carries a default route for this box: the primary WAN names
+# plus, when multi-WAN is on, each uplink mydist-mwan balances over. A plain
+# `for w in wan wan6` loop silently skipped wan2/wan3 -- measured on the bench:
+# only eth2 got the downlink hook and eth3 never did, so the second uplink's
+# return direction walked netfilter while the first one was accelerated.
+dpd_uplink_devs() {
+	local w d
+
+	for w in wan wan6 wan_6; do
+		d="$(dpd_resolve_logical "$w")"
+		[ -n "$d" ] && echo "$d"
+	done
+
+	# Only when the balancer is on: otherwise mydist_mwan's sections may be
+	# leftover experiments and must not get a hook.
+	[ "$(uci -q get mydist_mwan.global.enabled 2>/dev/null)" = "1" ] || return 0
+	for w in $(uci -q show mydist_mwan 2>/dev/null |
+		sed -n 's/^mydist_mwan\.\([^.=]*\)\.interface=.*/\1/p'); do
+		d="$(dpd_resolve_logical "$w")"
+		[ -n "$d" ] && echo "$d"
+	done
+}
+
 dpd_reconcile_uplink() {
 	local w d n=0 downlink=0 mode=""
 
@@ -320,9 +343,7 @@ dpd_reconcile_uplink() {
 	config_get mode global mode off
 	dpd_downlink_wanted "$mode" "$downlink" || downlink=0
 
-	for w in wan wan6 wan_6; do
-		d="$(dpd_resolve_logical "$w")"
-		[ -n "$d" ] || continue
+	for d in $(dpd_uplink_devs | awk '!seen[$0]++'); do
 		if [ "$downlink" = 1 ]; then
 			# attached on purpose; the chain guard decides whether the
 			# policy layer is behind us on that device too
