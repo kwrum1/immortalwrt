@@ -24,7 +24,7 @@ BASE_TABLE=100
 BASE_MARK=0x101
 BASE_PREF=40
 BASE_PORT=20000
-PORT_STEP=10000
+PORT_STEP=5000
 MAX_WAN=8
 
 log() { logger -t mydist-mwan "$*"; }
@@ -68,6 +68,7 @@ le32() {
 
 flush_flows() {
 	[ -e "$PIN_FLOWS" ] && bpftool map flush pinned "$PIN_FLOWS" >/dev/null 2>&1
+	return 0
 }
 
 reconcile() {
@@ -142,31 +143,7 @@ reconcile() {
 	else
 		log "dpd_wans map not pinned (is dpd attached?)"
 	fi
-	# Downlink hooks live on the uplinks themselves. einat rebuilds its TCX
-	# links on `einat restart` and that drops every classic cls_bpf filter on
-	# the same netdev (measured 2026-10-27: after a restart eth2 kept its hook
-	# but eth1 lost it). Re-attach idempotently, from the same object the LAN
-	# hook is already using, so a restart does not silently disable download
-	# acceleration on one WAN.
-	for dev in $(awk '{print $2}' "$RUN/wans" | sort -u); do
-		dpd_hook "$dev"
-	done
 	flush_flows
-}
-
-DPD_OBJ=${DPD_OBJ:-/lib/bpf/dpd_fastpath.bpf.o}
-
-dpd_hook() {
-	local dev="$1"
-
-	[ -e "$DPD_OBJ" ] || return 0
-	[ -e "$PIN_WAN" ] || return 0
-	tc filter show dev "$dev" ingress 2>/dev/null | grep -q 'pref 100 bpf' && return 0
-	tc qdisc add dev "$dev" clsact 2>/dev/null
-	tc filter add dev "$dev" ingress pref 100 bpf obj "$DPD_OBJ" \
-		sec classifier direct-action 2>/dev/null \
-		&& log "dpd downlink hook on $dev" \
-		|| log "dpd hook on $dev failed"
 }
 
 cleanup_rules() {
