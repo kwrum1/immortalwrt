@@ -50,17 +50,12 @@ function fmtBytes(n) {
 	return (i ? n.toFixed(1) : String(n)) + ' ' + unit[i];
 }
 
-function uciRun(args) {
-	return fs.exec('/sbin/uci', args).then(function(res) {
-		if (res.code != 0)
-			throw new Error(((res.stderr || '') + (res.stdout || '')).trim() ||
-				'uci ' + args.join(' '));
-
-		return res;
-	});
-}
-
 return view.extend({
+	/* The LuCI view base appends its own Save & Apply footer (ui.changes.apply) for views that inherit handleSaveApply. This page has explicit buttons and applies through the uci RPC, so suppress the inherited footer instead of showing a second button. */
+	handleSave: null,
+	handleSaveApply: null,
+	handleReset: null,
+
 	load: function() {
 		var self = this;
 
@@ -318,40 +313,63 @@ return view.extend({
 
 	applyChanges: function(cmds, opts) {
 		var self = this;
-		var p = Promise.resolve();
 
 		opts = opts || {};
 
+		/* Stage through the LuCI uci RPC, not /sbin/uci: the RPC is the path
+		 * the page ACL covers (write.uci mydist_mwan), while fs.exec would
+		 * need a shell command whitelist and was rejected with "no permission".
+		 *
+		 * Command shapes from the callers:
+		 *   [set, mydist_mwan, <name>, <type>]        create a section
+		 *   [set, mydist_mwan, <sid>, <opt>, <val>]   set an option
+		 *   [delete, mydist_mwan, <sid>, <opt>]       unset an option
+		 *   [delete, mydist_mwan, <sid>]              remove a section
+		 */
 		(cmds || []).forEach(function(args) {
-			p = p.then(function() { return uciRun(args); });
+			var op = args[0];
+
+			if (op == 'set' && args.length == 4) {
+				uci.add('mydist_mwan', args[3], args[2]);
+			}
+			else if (op == 'set') {
+				uci.set('mydist_mwan', args[2], args[3], args[4]);
+			}
+			else if (op == 'delete' && args.length == 4) {
+				if (uci.get('mydist_mwan', args[2], args[3]) !== undefined)
+					uci.unset('mydist_mwan', args[2], args[3]);
+			}
+			else if (op == 'delete') {
+				uci.remove('mydist_mwan', args[2]);
+			}
 		});
 
-		return p
-			.then(function() { return uciRun([ 'commit', 'mydist_mwan' ]); })
-			.then(function() {
-				if (opts.restart === false)
-					return;
+		return uci.save().then(function() {
+			/* commit + config-change triggers */
+			return uci.apply();
+		}).then(function() {
+			if (opts.restart === false)
+				return;
 
-				/* restart, not reload: enabling after it was stopped has to
-				 * start the health loop, disabling has to clean the rules. */
-				return fs.exec('/bin/sh', [ '-c',
-					'[ "$(uci -q get mydist_mwan.global.enabled)" = "1" ] && ' +
-					'exec /etc/init.d/mydist-mwan restart || ' +
-					'exec /etc/init.d/mydist-mwan stop'
-				]).catch(function() {});
-			})
-			.then(function() { return self.reload(); })
-			.then(function() {
-				if (opts.closeModal)
-					ui.hideModal();
-				if (opts.notify)
-					ui.addNotification(null, E('p', {}, [ opts.notify ]), 'info');
-			})
-			.catch(function(e) {
-				ui.addNotification(null, E('p', {}, [ e.message || String(e) ]), 'danger');
-			});
+			/* restart, not reload: enabling after it was stopped has to
+			 * start the health loop, disabling has to clean the rules.
+			 * The two exact init commands are what the ACL grants; do not
+			 * wrap them in /bin/sh. */
+			var on = uci.get('mydist_mwan', 'global', 'enabled') == '1';
+
+			return fs.exec('/etc/init.d/mydist-mwan',
+				[ on ? 'restart' : 'stop' ]).catch(function() {});
+		}).then(function() { return self.reload(); })
+		.then(function() {
+			if (opts.closeModal)
+				ui.hideModal();
+			if (opts.notify)
+				ui.addNotification(null, E('p', {}, [ opts.notify ]), 'info');
+		})
+		.catch(function(e) {
+			ui.addNotification(null, E('p', {}, [ e.message || String(e) ]), 'danger');
+		});
 	},
-
 	reload: function() {
 		var self = this;
 

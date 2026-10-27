@@ -128,6 +128,14 @@ reload_service() {
 	start_service
 }
 
+# The port allow-list is imported from /etc/config/firewall at start. A firewall
+# change (uci apply from the port-control page, or a manual edit) must re-import
+# it, otherwise the guard keeps dropping traffic to the new forward until the
+# next reboot.
+service_triggers() {
+	procd_add_reload_trigger "firewall"
+}
+
 extra_command "status" "Show attach state, acl_cfg, allow list and counters" || true
 
 status() {

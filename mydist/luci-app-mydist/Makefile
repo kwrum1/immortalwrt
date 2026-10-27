@@ -37,6 +37,8 @@ define Package/luci-app-mydist/install
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) ./files/menu-network.json $(1)/usr/share/luci/menu.d/zz-mydist-network.json
 	$(INSTALL_DATA) ./files/menu-firewall.json $(1)/usr/share/luci/menu.d/zz-mydist-firewall.json
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) ./files/acl.d/luci-app-mydist.json $(1)/usr/share/rpcd/acl.d/luci-app-mydist.json
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/mydist
 	$(INSTALL_DATA) ./files/htdocs/luci-static/resources/view/mydist/firewall.js $(1)/www/luci-static/resources/view/mydist/firewall.js
 	$(INSTALL_DATA) ./files/htdocs/luci-static/resources/view/mydist/mwan.js $(1)/www/luci-static/resources/view/mydist/mwan.js

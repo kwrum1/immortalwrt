@@ -1,7 +1,6 @@
 'use strict';
 'require view';
 'require uci';
-'require fs';
 'require ui';
 
 /* Network -> 防火墙: five-tuple port control, one WAN redirect per row.
@@ -13,28 +12,16 @@
  *     made "添加" feel broken.
  *   - The old save path only called uci.save() (writes /tmp/.uci) and then
  *     reloaded fw4. fw4 reads /etc/config, so the row did not actually apply
- *     until something else committed the config. Here every Save does
- *     `uci commit firewall` first.
+ *     until something else committed it. Here every Save stages the rows
+ *     through the LuCI uci RPC, then uci.save() + uci.apply() commits them
+ *     and lets the config-change trigger reload fw4.
  *
- * Rows are written straight through uci(1). src=wan, dest=lan and target=DNAT
+ * Rows are written through the uci RPC (the ACL-covered path, not /sbin/uci).
+ * src=wan, dest=lan and target=DNAT
  * are filled in on save so the table only asks for the five tuple. An
  * incomplete row (no source port or no destination address) is dropped instead
  * of being handed to fw4.
  */
-
-function uciRun(args) {
-	return fs.exec('/sbin/uci', args).then(function(res) {
-		if (res.code != 0)
-			throw new Error(((res.stderr || '') + (res.stdout || '')).trim() ||
-				'uci ' + args.join(' '));
-
-		return res;
-	});
-}
-
-function uciIgnore(args) {
-	return fs.exec('/sbin/uci', args).catch(function() { return null; });
-}
 
 function uciVal(v) {
 	if (v == null)
@@ -55,9 +42,10 @@ function uciProto(v) {
 return view.extend({
 	/* The LuCI view base class appends its own Save & Apply footer for every
 	 * view that inherits handleSaveApply(). That footer calls
-	 * ui.changes.apply() (the ubus/ACL path); this page writes through uci(1)
-	 * instead, so the extra button was both a duplicate and the source of the
-	 * "no permission" error. Shadow the three handlers with null so the base
+	 * ui.changes.apply() (the ubus/ACL path); this page has its own explicit
+	 * button that stages through the uci RPC, so the extra button was both a
+	 * duplicate and the source of the "no permission" error. Shadow the three
+	 * handlers with null so the base
 	 * footer is not rendered; the explicit button below the table is the only
 	 * one. */
 	handleSave: null,
@@ -313,11 +301,10 @@ return view.extend({
 
 	saveAll: function() {
 		var self = this;
-		var cmds = [];
-		var keep = [];
+		var ops = [];
 
 		self.removed.forEach(function(sid) {
-			cmds.push([ 'delete', 'firewall.' + sid ]);
+			ops.push({ op: 'remove', sid: sid });
 		});
 
 		self.rows.forEach(function(row) {
@@ -341,73 +328,57 @@ return view.extend({
 			 * existing one so fw4 does not keep a half-written redirect. */
 			if (!r.src_dport || !r.dest_ip) {
 				if (r.sid)
-					cmds.push([ 'delete', 'firewall.' + r.sid ]);
+					ops.push({ op: 'remove', sid: r.sid });
 				continue;
 			}
 
-			keep.push(r);
-		}
+			var sid = r.sid;
 
-		if (keep.length == self.rows.length && keep.length == 0)
-			return Promise.resolve();
-
-		var applied = Promise.resolve();
-
-		keep.forEach(function(r) {
-			var p = Promise.resolve(r.sid);
-
-			if (!r.sid) {
-				p = uciRun([ 'add', 'firewall', 'redirect' ]).then(function(res) {
-					return String(res.stdout || '').trim();
-				});
+			if (!sid) {
+				sid = uci.add('firewall', 'redirect');
+				r.sid = sid;
 			}
 
-			p = p.then(function(sid) {
-				if (!sid)
-					throw new Error(_('无法创建规则'));
+			var set = function(opt, val) {
+				ops.push(val == ''
+					? { op: 'unset', sid: sid, opt: opt }
+					: { op: 'set', sid: sid, opt: opt, val: val });
+			};
 
-				r.sid = sid;
+			set('name', r.name);
+			set('proto', r.proto);
+			set('src_dport', r.src_dport);
+			set('src_ip', r.src_ip);
+			set('dest_ip', r.dest_ip);
+			set('dest_port', r.dest_port || r.src_dport);
+			set('enabled', r.enabled ? '1' : '0');
 
-				var set = function(opt, val) {
-					cmds.push(val == ''
-						? [ 'delete', 'firewall.' + sid + '.' + opt ]
-						: [ 'set', 'firewall.' + sid + '.' + opt, val ]);
-				};
+			/* Non-tuple parts are this page's contract with fw4. */
+			set('src', 'wan');
+			set('dest', 'lan');
+			set('target', 'DNAT');
+		}
 
-				set('name', r.name);
-				set('proto', r.proto);
-				set('src_dport', r.src_dport);
-				set('src_ip', r.src_ip);
-				set('dest_ip', r.dest_ip);
-				set('dest_port', r.dest_port || r.src_dport);
-				set('enabled', r.enabled ? '1' : '0');
-
-				/* Non-tuple parts are this page's contract with fw4. */
-				cmds.push([ 'set', 'firewall.' + sid + '.src', 'wan' ]);
-				cmds.push([ 'set', 'firewall.' + sid + '.dest', 'lan' ]);
-				cmds.push([ 'set', 'firewall.' + sid + '.target', 'DNAT' ]);
-
-				return true;
-			});
-
-			applied = applied.then(function() { return p; });
+		/* The writes go through the LuCI uci RPC, not /sbin/uci: that is the
+		 * path the page's ACL covers (write.uci firewall), and unlike
+		 * fs.exec() it does not need a shell command whitelist. */
+		ops.forEach(function(o) {
+			if (o.op == 'remove') {
+				uci.remove('firewall', o.sid);
+			}
+			else if (o.op == 'unset') {
+				if (uci.get('firewall', o.sid, o.opt) !== undefined)
+					uci.unset('firewall', o.sid, o.opt);
+			}
+			else {
+				uci.set('firewall', o.sid, o.opt, o.val);
+			}
 		});
 
-		return applied.then(function() {
-			/* cmds was filled by the chain above; run it in order. */
-			var p = Promise.resolve();
-
-			cmds.forEach(function(args) {
-				p = p.then(function() {
-					return args[0] == 'delete' ? uciIgnore(args) : uciRun(args);
-				});
-			});
-
-			return p;
-		}).then(function() {
-			return uciRun([ 'commit', 'firewall' ]);
-		}).then(function() {
-			return fs.exec('/etc/init.d/firewall', [ 'reload' ]).catch(function() {});
+		return uci.save().then(function() {
+			/* Commit and reload: uci apply runs the config-change triggers, so
+			 * fw4 reloads without a shell exec. */
+			return uci.apply();
 		}).then(function() {
 			return self.reload();
 		}).then(function() {
@@ -416,7 +387,6 @@ return view.extend({
 			ui.addNotification(null, E('p', {}, [ e.message || String(e) ]), 'danger');
 		});
 	},
-
 	reload: function() {
 		var self = this;
 
