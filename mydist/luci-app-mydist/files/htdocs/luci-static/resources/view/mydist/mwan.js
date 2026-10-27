@@ -92,11 +92,11 @@ return view.extend({
 		o.description = _('关闭后恢复单 WAN 行为：清掉 fwmark 规则和 dpd_wans 表。');
 
 		o = s.option(form.Value, 'health_interval', _('健康检查间隔'));
-		o.datatype = 'uinteger';
+		o.datatype = 'range(1,3600)';
 		o.default = '5';
 		o.rmempty = false;
 		o.placeholder = '5';
-		o.description = _('秒。常驻的 health 循环按这个间隔 ping 每条 WAN 的健康目标。');
+		o.description = _('秒（1–3600）。常驻的 health 循环按这个间隔 ping 每条 WAN 的健康目标。');
 
 		s = m.section(form.GridSection, 'wan', _('WAN 接口'));
 		s.anonymous = true;
