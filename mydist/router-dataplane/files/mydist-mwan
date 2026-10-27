@@ -19,12 +19,9 @@
 CONF=mydist_mwan
 RUN=/var/run/mydist-mwan
 PIN_WAN=/sys/fs/bpf/tc/globals/dpd_wans
-PIN_FLOWS=/sys/fs/bpf/tc/globals/dpd_flows
 BASE_TABLE=100
 BASE_MARK=0x101
 BASE_PREF=40
-BASE_PORT=20000
-PORT_STEP=5000
 MAX_WAN=8
 
 log() { logger -t mydist-mwan "$*"; }
@@ -66,10 +63,6 @@ le32() {
 		$(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 ))
 }
 
-flush_flows() {
-	[ -e "$PIN_FLOWS" ] && bpftool map flush pinned "$PIN_FLOWS" >/dev/null 2>&1
-	return 0
-}
 
 reconcile() {
 	mkdir -p "$RUN"
@@ -133,12 +126,11 @@ reconcile() {
 
 		ip rule del fwmark "$mark" 2>/dev/null
 		ip rule add fwmark "$mark" lookup "$table" pref "$pref"
-		# NAT instance with its own port range
-		local p1 p2
-		p1=$((BASE_PORT + i * PORT_STEP))
-		p2=$((p1 + PORT_STEP - 1))
 		[ -n "$health" ] || health="${gw:-1.1.1.1}"
-		echo "$ifn $dev $mark $table $pref $weight $health $flags $p1 $p2" >> "$RUN/wans"
+		# eight fields: the LuCI page and the health loop read exactly these.
+		# einat owns the NAT port ranges (it shifts its own base per instance);
+		# duplicating them here only produced a second, wrong answer.
+		echo "$ifn $dev $mark $table $pref $weight $health $flags" >> "$RUN/wans"
 
 		entries="$entries $(le32 $(cat /sys/class/net/$dev/ifindex)) $(le32 $mark) $(le32 $weight) $(le32 $flags)"
 		if [ "$l3" = 1 ]; then
@@ -165,7 +157,6 @@ reconcile() {
 	else
 		log "dpd_wans map not pinned (is dpd attached?)"
 	fi
-	flush_flows
 }
 
 cleanup_rules() {
@@ -194,7 +185,7 @@ health_once() {
 	local changed=0
 	local tmp="$RUN/wans.new"
 	: > "$tmp"
-	while read -r ifn dev mark table pref weight target flags p1 p2; do
+	while read -r ifn dev mark table pref weight target flags; do
 		local up=1
 		ping -c1 -W2 -I "$dev" "$target" >/dev/null 2>&1 || up=0
 		if [ "$up" = 1 ]; then
@@ -204,7 +195,7 @@ health_once() {
 			[ $((flags & 1)) -eq 1 ] && changed=1
 			flags=$((flags & ~1))
 		fi
-		echo "$ifn $dev $mark $table $pref $weight $target $flags $p1 $p2" >> "$tmp"
+		echo "$ifn $dev $mark $table $pref $weight $target $flags" >> "$tmp"
 	done < "$RUN/wans"
 	mv "$tmp" "$RUN/wans"
 	if [ "$changed" = 1 ]; then

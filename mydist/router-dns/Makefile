@@ -125,6 +125,7 @@ define Package/router-dns/install
 	$(INSTALL_DIR) $(1)/usr/libexec
 	$(INSTALL_BIN) ./files/honk-dns.sh $(1)/usr/libexec/router-honk-dns
 	$(INSTALL_BIN) ./files/router-dns-sync.sh $(1)/usr/libexec/router-dns-sync
+	$(INSTALL_BIN) ./files/router-dns-lease $(1)/usr/libexec/router-dns-lease
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/router_dns.config $(1)/etc/config/router_dns
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface

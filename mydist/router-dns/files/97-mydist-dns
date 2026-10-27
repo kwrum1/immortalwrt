@@ -38,6 +38,12 @@ uci -q set smartdns.@smartdns[0].auto_set_dnsmasq='0'
 # respawns it (mydist-posture also stops and disables it at S26).
 uci -q set dhcp.@dnsmasq[0].port='0'
 uci -q set dhcp.@dnsmasq[0].noresolv='1'
+
+# Lease events must reach SmartDNS. The stock trigger only SIGHUPs dnsmasq,
+# which is not the resolver here, so `<dhcp-client>.lan` answered NXDOMAIN even
+# though odhcpd had published the name in /tmp/hosts. Our trigger rebuilds
+# SmartDNS's hosts/address files (idempotent, writes only on change).
+uci -q set dhcp.odhcpd.leasetrigger='/usr/libexec/router-dns-lease'
 uci -q commit dhcp
 
 # Upstreams, only when none are configured yet. These are DNS-over-TLS, not

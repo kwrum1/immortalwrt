@@ -20,7 +20,7 @@
  *     restart mydist-mwan). There is no page-level Save that can be forgotten.
  *
  * Status comes from /var/run/mydist-mwan/wans (one line per reconciled uplink:
- * ifn dev mark table pref weight target flags p1 p2, flags bit 0 = up) and
+ * ifn dev mark table pref weight target flags, flags bit 0 = up) and
  * from netifd's device statistics.
  */
 

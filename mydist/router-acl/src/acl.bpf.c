@@ -265,22 +265,36 @@ static __always_inline int acl_port_allowed(__u16 family, __u16 proto, __u16 sco
 /* Is this destination inside one of the configured LAN prefixes? Only used by
  * the opt-in `fullcone` path: it is the one check that cannot tell "einat
  * un-SNATed this into the LAN" from "somebody forged a LAN destination", which
- * is why it is off by default. */
+ * is why it is off by default.
+ *
+ * The prefixes are unrolled on purpose. With a runtime loop the verifier could
+ * not bound the index by the array size (it saw the fifth iteration touch
+ * offset 76 of a 72-byte map value) and rejected the whole program with
+ * EACCES: "invalid access to map value, value_size=72 off=76". That took
+ * acl_ingress off the WAN entirely -- the guard, the port allow-list and the
+ * bypass marks were all missing while the service looked "enabled". Constant
+ * indices need no range proof, so each access is accepted on its own. */
 static __always_inline int acl_lan_v4_match(struct acl_config *cfg, __be32 daddr)
 {
-	__u32 i;
-
 	if (!cfg->fullcone)
 		return 0;
-	if (cfg->lan_count > ACL_MAX_LAN_V4)
-		return 0;
 
-	for (i = 0; i < ACL_MAX_LAN_V4; i++) {
-		if (i >= cfg->lan_count)
-			break;
-		if ((daddr & cfg->lan_v4[i].mask) == cfg->lan_v4[i].net)
-			return 1;
-	}
+	_Static_assert(ACL_MAX_LAN_V4 == 4,
+		       "acl_lan_v4_match is unrolled for four prefixes");
+
+	if (cfg->lan_count > 0 &&
+	    (daddr & cfg->lan_v4[0].mask) == cfg->lan_v4[0].net)
+		return 1;
+	if (cfg->lan_count > 1 &&
+	    (daddr & cfg->lan_v4[1].mask) == cfg->lan_v4[1].net)
+		return 1;
+	if (cfg->lan_count > 2 &&
+	    (daddr & cfg->lan_v4[2].mask) == cfg->lan_v4[2].net)
+		return 1;
+	if (cfg->lan_count > 3 &&
+	    (daddr & cfg->lan_v4[3].mask) == cfg->lan_v4[3].net)
+		return 1;
+
 	return 0;
 }
 

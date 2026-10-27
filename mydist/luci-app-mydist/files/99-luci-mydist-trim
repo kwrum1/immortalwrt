@@ -73,7 +73,22 @@ if [ -f /etc/config/router_qos ]; then
 	uci -q commit router_qos
 fi
 rm -f /www/luci-static/resources/view/mydist/qos.js 2>/dev/null
+# The package ships the init script but does not enable it by itself; without
+# this the qdisc is only installed when someone restarts it by hand. (Measured
+# on the bench: /etc/init.d/router-qos enabled -> false after a clean flash.)
+[ -x /etc/init.d/router-qos ] && /etc/init.d/router-qos enable >/dev/null 2>&1
 /etc/init.d/router-qos restart >/dev/null 2>&1
+
+# --- dpd: downlink is default-on now ---------------------------------------
+# `option downlink` did not exist in the first images, so an upgraded
+# /etc/config/dpd_fastpath has no key at all and the init's `0` default keeps
+# the return direction unaccelerated. Fill in the missing key only: an explicit
+# 0 from the operator stays 0.
+if [ -f /etc/config/dpd_fastpath ] &&
+	! uci -q get dpd_fastpath.global.downlink >/dev/null 2>&1; then
+	uci -q set dpd_fastpath.global.downlink='1'
+	uci -q commit dpd_fastpath
+fi
 
 logger -t mydist "luci: firewall posture open + rule 999 on; SmartDNS owns :53; QoS on (no knobs)"
 exit 0

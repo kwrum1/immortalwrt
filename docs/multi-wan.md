@@ -133,13 +133,15 @@ PPPoE 刚拨上、网关变了）可以用 `reload`，它不会杀掉 health 循
 
 ```sh
 cat /var/run/mydist-mwan/wans
-# ifn dev mark table pref weight target flags p1 p2
-# wan  eth1 0x101 100 40 2 1.1.1.1 1 20000 29999
-# wan2 eth2 0x102 101 41 1 1.0.0.1 1 30000 39999
+# ifn dev mark table pref weight target flags
+# wan  eth1 257 100 40 2 1.1.1.1 1
+# wan2 eth2 258 101 41 1 1.0.0.1 1
 ```
 
 - `flags` 最低位 = up；
-- `p1 p2` 是该 WAN 的 einat NAT 端口段，不能重叠；
+- einat 的 NAT 端口段不在这里：每个 einat 实例自己按配置的基段顺序平移
+  （`20000-29999` 宽 10000，所以第二段是 `30000-39999`），用
+  `einat_shift_ports` 生成，`ps` 里能看到每个实例实际使用的段；
 - 文件为空/不存在：服务没运行，或没有一条 WAN 达到可用条件（netifd up +
   网关/邻居就绪）。
 
@@ -231,8 +233,9 @@ nft 逐包处理，不是选路。
 - NAT 唯一归属 einat；`einat.init` 会让 fw4 关闭 masquerade。不要再手工开
   `masquerade`，否则同一条流会被 fw4 先 SNAT、einat 再 SNAT，源端口变化会
   导致服务器 RST（实验台踩过）。
-- 每条 WAN 的 einat 端口段由 `mydist-mwan` 按顺序分配
-  （20000–29999、30000–39999……），不要手工再起一个 einat 抢同一段。
+- 每条 WAN 的 einat 端口段由 `einat.init` 按配置基段顺序平移分配
+  （`20000–29999`、`30000–39999`……），`mydist-mwan` 不再重复计算；
+  不要手工再起一个 einat 抢同一段。
 - `einat restart` 会删掉同一 netdev 上的 classic dpd 过滤器；
   `mydist-mwan restart`（或 reconcile）会自动重挂每条 WAN 的 downlink 钩子。
   只重启 einat 而不 reconcile 时，下载仍能转发，只是没有快路径。
@@ -292,11 +295,50 @@ tc filter show dev eth2 ingress
 
 1. **真实 PPPoE 双拨未测**：实验台只有以太网。`l3_device=pppoe-wanN` 的
    无头 redirect 路径已按代码写好，但没有在两条真实 PPPoE 上跑过。
-2. **物理断线/上游不可达的健康切换未实测**：本次“断一条”用
-   `enabled=0` + reconcile 模拟；health 循环会 ping 健康目标，但
-   “链路 carrier 在、上游 ping 不通”的组合还需要一次拔线/黑洞测试。
-   netifd 判定接口 down 时，reconcile 会把该 WAN 从 `dpd_wans` 移除。
+2. **上游黑洞切换未实测**：netifd 判 down（`ifdown wan` / 拔线）的切换已
+   实测通过；health 循环会 ping 健康目标，把该 WAN 从 `dpd_wans` 摘掉，
+   但“链路 carrier 在、上游 ping 不通”的组合还需要一次黑洞测试。
 3. **权重 8 上限**没有在页面上提示 clamp 细节（页面限制 1–8）。
-4. **`dpdctl` 版本**：镜像里旧 `dpdctl` 的流表解码 ABI 可能与新对象不一致；
-   判断选路请用 `bpftool map dump` 的原始值，不要用旧 `dpdctl flows`。
+4. **`dpdctl` 必须和对象同版本**：`dpdctl version` 应输出 `abi 8`。
+   旧镜像里的 `dpdctl` 是 ABI 4，`dpdctl flows/stats` 会按错位字段解码；
+   判断选路请用 `bpftool map dump` 或先核对 ABI。
 5. 页面不做 failover、不做 IPv6、不做每条 WAN 的实时速率/流数。
+
+### 7.1 代理（honk）与多 WAN 不能同时生效
+
+honk 启动后在 br-lan 上挂 TCX 程序，`tcx_run()` 先于 classic 链；dpd 的
+门控检测到这一点会把有效模式降为 `observe`（日志：
+`gate: mode 'stateful' downgraded to 'observe'`）。observe 不建流表、不写
+fwmark，于是所有流量走主路由表，只有一条 WAN 承载。
+
+实测（honk 开，64 流）：`eth2 +885 MB / eth3 +238 B`；关掉 honk 后同一测试
+是 `eth2 +742 MB / eth3 +688 MB`（1.76:1，接近 2:1）。
+
+这是当前架构的边界，不是配置错误：要让代理和多 WAN 同时工作，需要由
+代理自己按 WAN 选路（dae 的 `wan_interface` 是单接口）。在做到那一步之前，
+二选一：要负载均衡就关代理，要代理就接受单 WAN 出口。
+
+### 7.2 端口转发的 hairpin（LAN → WAN IP）
+
+fw4 的 reflection 规则只做 DNAT（`dstnat_lan`），没有 SNAT；LAN 客户端访问
+`198.18.0.1:<转发端口>` 时源地址仍是自己，回包无法回到路由器。einat 的
+`--hairpin-if` 只覆盖它自己做 SNAT 的流，不覆盖 fw4 DNAT 的转发。
+从 WAN 侧访问转发端口是正常的（实测 WAN1/WAN2 都能拿到 SSH banner）。
+需要 hairpin 时，给 LAN 区域临时开 `masq` 或加一条针对该转发端口的 SNAT
+规则。
+
+### 7.3 入站安全边界在 router-acl
+
+einat 会在 fw4 的 `forward_wan` 链顶部注入一条**无条件的 WAN→LAN
+ACCEPT**（加速流的回包没有 conntrack，必须放行）。真正决定“谁能进来”的
+是 router-acl 的 classic ingress 过滤器（pref 90，先于 netfilter）。
+
+因此：**router-acl 没加载时，WAN 到 LAN 是敞开的**。镜像里如果出现
+`acl_ingress` 加载失败，必须当成阻断级故障处理，不能只看
+`/etc/init.d/router-acl enabled`。检查：
+
+```sh
+tc filter show dev eth2 ingress          # 应有 pref 90 的 bpf
+aclctl stats                             # 能读出计数器
+logread | grep -i 'acl_ingress'
+```
