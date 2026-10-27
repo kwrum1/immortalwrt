@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# mydist / router-dataplane : dpd-fastpath
+# ebpf / router-dataplane : dpd-fastpath
 #
 # The TC ingress eBPF fastpath. See src/dpd_common.h for the redlines.
 # Depends only on things already in the shipped baseline:
@@ -24,7 +24,7 @@ include $(INCLUDE_DIR)/bpf.mk
 define Package/dpd-fastpath
   SECTION:=net
   CATEGORY:=Network
-  TITLE:=mydist TC ingress eBPF fastpath (dpd)
+  TITLE:=eBPF TC ingress fastpath (dpd)
   URL:=https://github.com/kwrum1/openwrt-honk
   DEPENDS:=+libbpf +libelf +kmod-sched-core +kmod-sched-bpf +tc-bpf $(BPF_DEPENDS)
 endef

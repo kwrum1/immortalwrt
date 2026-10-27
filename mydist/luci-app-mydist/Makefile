@@ -12,7 +12,7 @@ define Package/luci-app-mydist
   SECTION:=luci
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
-  TITLE:=mydist menu layout and the simple firewall
+  TITLE:=eBPF datapath: menu layout and the simple firewall
   DEPENDS:=+luci-base +luci-compat +luci-lua-runtime +luci-app-smartdns +luci-app-honk
   PKGARCH:=all
 endef

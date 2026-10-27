@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# mydist / router-tuning : first-boot performance profile.
+# ebpf / router-tuning : first-boot performance profile.
 #
 # x86, rockchip and qualcommax all get the same script; the differences are
 # detected at runtime (CPU count, RAM, guest-vs-metal, WAN device) rather than
@@ -32,7 +32,7 @@ include $(INCLUDE_DIR)/package.mk
 define Package/router-tuning
   SECTION:=net
   CATEGORY:=Network
-  TITLE:=mydist first-boot performance tuning (sysctl / NIC / BBR)
+  TITLE:=first-boot performance tuning (sysctl / NIC / BBR)
   URL:=https://github.com/kwrum1/openwrt-honk
   DEPENDS:=+kmod-tcp-bbr +kmod-sched +ethtool
 endef

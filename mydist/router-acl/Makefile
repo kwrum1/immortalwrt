@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# mydist / router-acl : the WAN eBPF ACL
+# ebpf / router-acl : the WAN eBPF ACL
 #
 # See src/acl_common.h for the redlines and the hook layout. Depends only on
 # things already in the shipped baseline: libbpf/libelf come in with ip-full and
@@ -23,7 +23,7 @@ include $(INCLUDE_DIR)/bpf.mk
 define Package/router-acl
   SECTION:=net
   CATEGORY:=Network
-  TITLE:=mydist WAN eBPF ACL (drop unsolicited inbound, escape conntrack)
+  TITLE:=eBPF WAN ACL (drop unsolicited inbound, escape conntrack)
   URL:=https://github.com/kwrum1/openwrt-honk
   DEPENDS:=+libbpf +libelf +kmod-sched-core +kmod-sched-bpf +kmod-nft-core +tc-bpf $(BPF_DEPENDS)
 endef

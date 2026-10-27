@@ -1,4 +1,4 @@
-# mydist / router-dns
+# router-dns
 
 smartdns is the only resolver and owns `:53`. dnsmasq has no DNS role at all
 (`port 0`) and is stopped by `mydist-posture`; odhcpd is the DHCP authority.

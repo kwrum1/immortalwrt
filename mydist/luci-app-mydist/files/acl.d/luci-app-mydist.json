@@ -1,6 +1,6 @@
 {
 	"luci-app-mydist": {
-		"description": "mydist pages: multi-WAN configuration, firewall port control and status",
+		"description": "ebpf pages: multi-WAN configuration, firewall port control and status",
 		"read": {
 			"ubus": {
 				"network.interface": [ "dump" ],

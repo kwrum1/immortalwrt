@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# mydist / router-dns : smartdns is the only resolver (it owns :53).
+# ebpf / router-dns : smartdns is the only resolver (it owns :53).
 #
 # Round 10 (2026-10-20): the upstream/name handling moved into
 # /usr/libexec/router-dns-sync (see that file and README.md). In short: smartdns
@@ -96,7 +96,7 @@ include $(INCLUDE_DIR)/package.mk
 define Package/router-dns
   SECTION:=net
   CATEGORY:=Network
-  TITLE:=mydist DNS (smartdns is the only resolver)
+  TITLE:=DNS plane (smartdns is the only resolver)
   URL:=https://github.com/kwrum1/openwrt-honk
   DEPENDS:=+smartdns +dnsmasq +jsonfilter
 endef

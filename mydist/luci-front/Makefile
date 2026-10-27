@@ -1,4 +1,4 @@
-# mydist / luci-front: the public HTTP(S) front end for LuCI.
+# ebpf / luci-front: the public HTTP(S) front end for LuCI.
 #
 # uhttpd keeps its two irreplaceable halves -- the embedded Lua interpreter that
 # runs /cgi-bin/luci and the libubus bridge for /ubus -- but it moves to

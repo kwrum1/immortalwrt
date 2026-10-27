@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# mydist: einat-ebpf as a PREBUILT-BINARY package.
+# ebpf: einat-ebpf as a PREBUILT-BINARY package.
 #
 # Why not build it from source: upstream's own OpenWrt packaging
 # (muink/openwrt-einat-ebpf) declares

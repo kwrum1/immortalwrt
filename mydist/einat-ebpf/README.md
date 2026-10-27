@@ -1,4 +1,4 @@
-# mydist/einat-ebpf —— eBPF Full Cone NAT（NAT44 的替代品）
+# einat-ebpf —— eBPF Full Cone NAT（NAT44 的替代品）
 
 ## 这个包解决什么
 

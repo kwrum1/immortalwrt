@@ -1,6 +1,6 @@
 # router-dataplane (`dpd-fastpath`)
 
-`mydist` 的数据面快路径。一个 TC-ingress eBPF 程序 + 一个 userspace 控制工具
+eBPF 数据面快路径。一个 TC-ingress eBPF 程序 + 一个 userspace 控制工具
 （`dpdctl`），目的是**把「已经建立连接的家用转发」从内核 netfilter 栈里摘出来**，
 走 FIB 查表 + 直接重定向。
 
@@ -287,7 +287,7 @@ UDP 没有握手，`nf_conntrack_udp_timeout_stream`（180 秒）在加速流上
 ## 3. 文件
 
 ```
-mydist/router-dataplane/
+ebpf/router-dataplane/
 ├── Makefile                      # OpenWrt 包定义；不用 CompileBPF（宿主缺 llc/opt/llvm-*）
 ├── src/
 │   ├── dpd_common.h              # BPF ↔ dpdctl 的共享 ABI、红线、钩子布局

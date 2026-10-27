@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# mydist / router-qos : CAKE on the WAN, one qdisc, no classifier cascade.
+# ebpf / router-qos : CAKE on the WAN, one qdisc, no classifier cascade.
 #
 # Script-only package: no compilation, no eBPF object, nothing to shape but the
 # upload. CAKE does its own per-flow fairness, ack filtering and DSCP->tin
@@ -28,7 +28,7 @@ include $(INCLUDE_DIR)/package.mk
 define Package/router-qos
   SECTION:=net
   CATEGORY:=Network
-  TITLE:=mydist CAKE QoS (single root qdisc on the WAN)
+  TITLE:=CAKE QoS (single root qdisc on the WAN)
   URL:=https://github.com/kwrum1/openwrt-honk
   DEPENDS:=+kmod-sched-core +kmod-sched-cake +tc-bpf
 endef
