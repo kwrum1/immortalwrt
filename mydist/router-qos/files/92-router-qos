@@ -46,7 +46,7 @@ ifup|ifupdate|add|update)
 	[ -n "$DEVICE" ] || exit 0
 	rq_selected || exit 0
 
-	rq_apply "$DEVICE" "$(rq_cake_opts "$RQ_UP" "$RQ_OVERHEAD" "$RQ_MPU" \
+	rq_apply "$DEVICE" "$(rq_best_opts "$DEVICE" "$RQ_UP" "$RQ_OVERHEAD" "$RQ_MPU" \
 		"$RQ_DIFFSERV" "$RQ_WASH" "$RQ_NAT")"
 	rq_log "hotplug $ACTION $INTERFACE -> $DEVICE applied"
 	;;

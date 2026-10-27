@@ -93,16 +93,48 @@ rq_cake_opts() {
 	printf '%s' "$opts"
 }
 
+# The one maintained policy. The UI deliberately does not expose the kernel
+# knobs: a home router has one right answer here, and a wrong `overhead` or a
+# disabled DSCP map only shows up as "why is my latency bad".
+#
+#   diffserv4  four tins (Bulk / Best Effort / Video / Voice). besteffort would
+#              throw away the priority mapping that makes CAKE useful.
+#   nat        this box NATs everything on the WAN; without `nat` CAKE cannot
+#              keep both directions of a flow in the same tin.
+#   overhead   inferred from the device when the operator left it at 0:
+#              ppp* / tun* = 34 (PPPoE over Ethernet with the VLAN tag), plain
+#              Ethernet keeps 0 (the kernel already accounts for it).
+#   wash       left as configured (0 by default: trust LAN DSCP, as the docs
+#              argued), because washing silently downgrades local markings.
+rq_best_opts() {
+	local dev="$1" bw="$2" overhead="$3" mpu="$4" diffserv="$5" wash="$6" nat="$7"
+
+	case "$diffserv" in
+	''|none) diffserv="diffserv4" ;;
+	esac
+	nat="1"
+	case "$dev" in
+	ppp*|tun*|wg*) [ "${overhead:-0}" = "0" ] && overhead=34 ;;
+	esac
+	rq_cake_opts "$bw" "$overhead" "$mpu" "$diffserv" "$wash" "$nat"
+}
+
 rq_apply() {
 	local dev="$1" opts="$2"
 
 	[ -e "/sys/class/net/$dev" ] || return 1
-	if ! tc qdisc replace dev "$dev" root cake $opts 2>/dev/null; then
-		rq_log "apply: cake on $dev failed ($opts)"
-		return 1
+	if tc qdisc replace dev "$dev" root cake $opts 2>/dev/null; then
+		rq_log "apply: cake on $dev ($opts)"
+		return 0
 	fi
-	rq_log "apply: cake on $dev ($opts)"
-	return 0
+	# No cake module (or a kernel that rejects the options): keep per-flow
+	# fairness instead of leaving the device on its default queue.
+	if tc qdisc replace dev "$dev" root fq_codel 2>/dev/null; then
+		rq_log "apply: cake unavailable on $dev, fell back to fq_codel"
+		return 0
+	fi
+	rq_log "apply: neither cake nor fq_codel worked on $dev"
+	return 1
 }
 
 rq_clear() {

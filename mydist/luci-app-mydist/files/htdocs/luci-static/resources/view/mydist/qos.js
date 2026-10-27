@@ -10,6 +10,13 @@
  * 0. Only the upload direction is shaped here: feeding an IFB for the download
  * direction either does not delay the real packet or steals it from
  * router-acl/dpd, so this page stays with the shaper that actually works.
+ *
+ * The scheduler is not configurable on purpose. There is one maintained policy
+ * (/usr/libexec/router-qos.sh: rq_best_opts): diffserv4 for the DSCP tins, NAT
+ * accounting on, framing overhead inferred for PPPoE/tunnels, and fq_codel as
+ * the fallback when the cake module is missing. Exposing overhead/mpu/wash/nat
+ * only produced "why is latency worse after I changed a number I did not
+ * understand".
  */
 
 return view.extend({
@@ -21,7 +28,7 @@ return view.extend({
 		var m, s, o;
 
 		m = new form.Map('router_qos', _('QoS'),
-			_('在 WAN 出口整形（CAKE），上传速率按实际带宽填写。'));
+			_('在 WAN 出口整形（CAKE），上传速率按实际带宽填写。调度算法由系统统一维护，无需配置。'));
 
 		s = m.section(form.NamedSection, 'global', 'router_qos', _('接口整形'));
 		s.addremove = false;
@@ -43,36 +50,9 @@ return view.extend({
 		o.rmempty = false;
 		o.placeholder = '100000';
 
-		o = s.option(form.ListValue, 'diffserv', _('调度模式'));
-		o.value('diffserv4', _('diffserv4（语音/视频优先）'));
-		o.value('diffserv3', _('diffserv3（三档）'));
-		o.value('besteffort', _('besteffort（只做公平）'));
-		o.default = 'diffserv4';
-		o.rmempty = false;
-
-		o = s.option(form.Value, 'overhead', _('链路开销'),
-			_('字节；PPPoE 常用 34（带 VLAN）或 8，以太网 0'));
-		o.datatype = 'uinteger';
-		o.default = '0';
-		o.rmempty = true;
-		o.placeholder = '0';
-
-		o = s.option(form.Value, 'mpu', _('最小包大小'),
-			_('字节，通常 0（不调整）或 64'));
-		o.datatype = 'uinteger';
-		o.default = '0';
-		o.rmempty = true;
-		o.placeholder = '0';
-
-		o = s.option(form.Flag, 'wash', _('清除 DSCP'),
-			_('不信任局域网主机设置的 DSCP'));
-		o.default = '0';
-		o.rmempty = false;
-
-		o = s.option(form.Flag, 'nat', _('NAT 模式'),
-			_('告诉 CAKE 路由器在做 NAT'));
-		o.default = '0';
-		o.rmempty = false;
+		o = s.option(form.DummyValue, 'policy', _('调度策略'));
+		o.rawhtml = true;
+		o.default = _('CAKE diffserv4 + NAT 记账；PPPoE/隧道自动加 34 字节开销；CAKE 不可用时回退 fq_codel。');
 
 		var save = m.save.bind(m);
 

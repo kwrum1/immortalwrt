@@ -59,7 +59,7 @@ start_service() {
 		return 0
 	fi
 
-	rq_apply "$dev" "$(rq_cake_opts "$RQ_UP" "$RQ_OVERHEAD" "$RQ_MPU" \
+	rq_apply "$dev" "$(rq_best_opts "$dev" "$RQ_UP" "$RQ_OVERHEAD" "$RQ_MPU" \
 		"$RQ_DIFFSERV" "$RQ_WASH" "$RQ_NAT")"
 	rq_log "started: dev=$dev upload=$RQ_UP"
 }

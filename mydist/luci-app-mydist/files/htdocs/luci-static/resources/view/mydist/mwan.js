@@ -68,6 +68,7 @@ return view.extend({
 				if (f.length >= 8)
 					self.runtime[f[0]] = {
 						dev: f[1],
+						weight: parseInt(f[5], 10) || 0,
 						flags: parseInt(f[7], 10) || 0
 					};
 			});
@@ -197,7 +198,8 @@ return view.extend({
 				return _('未就绪（服务未运行或该 WAN 还没有可用网关）');
 
 			var dev = rt.dev;
-			var txt = ((rt.flags & 1) ? _('up') : _('down')) + ' · ' + dev;
+			var txt = ((rt.flags & 1) ? _('up') : _('down')) + ' · ' + dev +
+				' · ' + _('生效权重') + ' ' + rt.weight;
 			var stats = (self.devstats[dev] || {}).statistics;
 
 			if (stats)
