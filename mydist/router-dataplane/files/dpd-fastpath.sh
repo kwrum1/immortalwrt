@@ -235,8 +235,8 @@ dpd_gate_mode() {
 		1) why="${why:-einat is not attached, so the reply of an accelerated flow would be dropped by fw4 (no conntrack state, no NAT)}" ;;
 		2) why="${why:-cannot tell whether einat is attached (no bpftool); refusing to accelerate blind}" ;;
 		esac
-		if [ -z "$why" ] && dpd_honk_owns; then
-			why="honk's TCX programs own every device this program hooks, so the classic chain is never reached -- the proxy is the datapath, and claiming a fastpath the counters cannot back would be a lie"
+		if [ -z "$why" ] && dpd_honk_owns && ! dpd_honk_passes_direct; then
+			why="honk owns the LAN TCX and its direct exit is terminal (unpatched core), so the classic chain never runs -- the proxy is the datapath, and claiming a fastpath the counters cannot back would be a lie"
 		fi
 	fi
 	if [ -n "$why" ]; then
@@ -251,22 +251,27 @@ dpd_gate_mode() {
 # administratively/link down, and has a default route. pppoe-wan only appears
 # once the session is up, so this is naturally false until then and the gate is
 # re-evaluated on every ifup/hotplug.
+#
+# Every uplink counts, not just `wan`: with multi-WAN, `ifdown wan` leaves wan2
+# up and carrying the default route, but a `network_get_device dev wan` probe
+# answers "no uplink" and the gate then downgrades to observe -- measured on the
+# bench during the failover test, which silently turned acceleration off for the
+# surviving link. dpd_uplink_devs() is the same list the downlink reconciler
+# uses, so both agree on what an uplink is.
 dpd_has_uplink() {
 	local dev state
-	# network_get_device lives in /lib/functions/network.sh, not in
-	# /lib/functions.sh; without this the lookup exits 127 and the gate永远
-	# believes there is no uplink (measured 2026-10-19: the WAN was up with a
-	# default route and dpd still logged "no uplink"). Sourcing twice is safe.
+
 	. /lib/functions/network.sh 2>/dev/null
-	network_get_device dev wan 2>/dev/null || dev=""
-	[ -n "$dev" ] || return 1
-	[ -e "/sys/class/net/$dev" ] || return 1
-	state=$(cat "/sys/class/net/$dev/operstate" 2>/dev/null)
-	case "$state" in
-	down | lowerlayerdown | notpresent) return 1 ;;
-	esac
-	ip route show default 2>/dev/null | grep -q . || return 1
-	return 0
+
+	for dev in $(dpd_uplink_devs); do
+		[ -e "/sys/class/net/$dev" ] || continue
+		state=$(cat "/sys/class/net/$dev/operstate" 2>/dev/null)
+		case "$state" in
+		down | lowerlayerdown | notpresent) continue ;;
+		esac
+		ip route show default 2>/dev/null | grep -q . && return 0
+	done
+	return 1
 }
 
 # Re-evaluate the gates from uci and publish the result.
@@ -446,9 +451,9 @@ dpd_einat_attached() {
 
 # Do honk's TCX programs own the datapath on the devices this program hooks?
 #
-# honk attaches TCX on br-lan, eth0, eth1 and dae0 -- every device we are on --
-# and its programs return a verdict for every packet they see. Source fact,
-# linux-6.18.55 net/core/dev.c:
+# honk attaches TCX on br-lan and its bridge slaves (and dae0); its programs
+# return a verdict for every packet they see. Source fact, linux-6.18.55
+# net/core/dev.c:
 #
 #	if (tcx_needed) { sch_ret = tcx_run(...);
 #			  if (sch_ret != TC_ACT_UNSPEC) goto ingress_verdict; }
@@ -456,8 +461,13 @@ dpd_einat_attached() {
 #
 # One non-UNSPEC verdict from any TCX program therefore skips the ENTIRE classic
 # chain, and this program is a classic filter. Measured 2026-10-18 (coexist
-# harness, QEMU x86_64): with honk running, a LAN->WAN flow that provably
-# traversed br-lan moved pkt_total by 0, on every device that was tried.
+# harness, QEMU x86_64): with the stock honk core, a LAN->WAN flow that provably
+# traversed br-lan moved pkt_total by 0.
+#
+# The p1 core is different on purpose: its direct exits return TC_ACT_UNSPEC
+# (see ci/patches/honk-direct-unspec.py in the honk package), so direct flows do
+# reach this filter while proxy/block verdicts stay terminal. The gate asks
+# dpd_honk_passes_direct() (the marker) before trusting that.
 #
 # Matching honk's *program names* and not "any TCX" keeps the answer honest:
 # einat's TCX on the uplink returns UNSPEC for packets it does not claim, so it
@@ -468,17 +478,29 @@ dpd_honk_owns() {
 		'tcx/(ingress|egress)[[:space:]]+(lan_ingress_l2|lan_egress_l2|wan_ingress_l2|wan_egress_l2|dae0_ingress)'
 }
 
+# Does the running honk core hand direct-classified flows back to the classic
+# chain? The patched core (honk package p1, ci/patches/honk-direct-unspec.py)
+# installs this marker and returns TC_ACT_UNSPEC for direct flows, so the only
+# packets reaching dpd are the ones we are allowed to accelerate. Proxy and
+# block verdicts stay terminal and never reach us.
+#
+# Without the marker, honk's direct exit is TC_ACT_OK and the classic chain is
+# skipped entirely. Accelerating the WAN return half in that state is not safe:
+# the flow table is learned on the LAN (which honk swallows), and a forced
+# stateful run was measured to break a TCP connection on the first reverse test.
+dpd_honk_passes_direct() {
+	[ -f /usr/share/honk/direct-unspec ]
+}
+
 # Is $1 the uplink device? Taking a packet over on the WAN would skip
 # router-acl's nft guard and the input path for router-destined packets, so
 # acceleration is LAN-side only.
 dpd_is_wan_device() {
-	local dev="$1" wdev=""
+	local dev="$1" d
 
 	[ -n "$dev" ] || return 1
-	for wdev in wan wan6 wan_6; do
-		local d
-		d="$(dpd_resolve_logical "$wdev")"
-		[ -n "$d" ] && [ "$d" = "$dev" ] && return 0
+	for d in $(dpd_uplink_devs); do
+		[ "$d" = "$dev" ] && return 0
 	done
 	return 1
 }

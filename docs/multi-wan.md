@@ -304,19 +304,37 @@ tc filter show dev eth2 ingress
    判断选路请用 `bpftool map dump` 或先核对 ABI。
 5. 页面不做 failover、不做 IPv6、不做每条 WAN 的实时速率/流数。
 
-### 7.1 代理（honk）与多 WAN 不能同时生效
+### 7.1 代理（honk）与多 WAN：按流分流（需要 p1 core）
 
-honk 启动后在 br-lan 上挂 TCX 程序，`tcx_run()` 先于 classic 链；dpd 的
-门控检测到这一点会把有效模式降为 `observe`（日志：
-`gate: mode 'stateful' downgraded to 'observe'`）。observe 不建流表、不写
-fwmark，于是所有流量走主路由表，只有一条 WAN 承载。
+上游 honk 的 `direct` 出口返回 `TC_ACT_OK`，内核因此**跳过整条 classic 链**，
+dpd 看不到任何直连包；这时 dpd 只能 `observe`，多 WAN 也随之失效（旧镜像
+实测：64 流全部走 eth2）。
 
-实测（honk 开，64 流）：`eth2 +885 MB / eth3 +238 B`；关掉 honk 后同一测试
-是 `eth2 +742 MB / eth3 +688 MB`（1.76:1，接近 2:1）。
+从 honk 包 **p1** 开始，直连出口改为返回 `TC_ACT_UNSPEC` 并带
+`DIRECT_UNSPEC_MARK`（`ci/patches/honk-direct-unspec.py`）：
 
-这是当前架构的边界，不是配置错误：要让代理和多 WAN 同时工作，需要由
-代理自己按 WAN 选路（dae 的 `wan_interface` 是单接口）。在做到那一步之前，
-二选一：要负载均衡就关代理，要代理就接受单 WAN 出口。
+- 直连包：跟着 classic 链走，dpd 学到流并加速；多 WAN 的 fwmark 正常；
+- 代理包：仍然 redirect 到 `dae0`，**不会**进入 classic 链，dpd 不参与；
+- block 包：`TC_ACT_SHOT`，同样不进入 classic；
+- NAT 仍是 einat（honk 不做 masquerade）。
+
+dpd 通过 `/usr/share/honk/direct-unspec` 这个 marker 判断 core 是否带 p1；
+没有 marker（上游原版 core）时门控仍然降为 `observe`，避免拿错的流表去加速
+回程。镜像里两个包必须一起升级：honk（p1 core + marker）+ router-dataplane。
+
+实测（实验台，honk 运行中，p1 core）：
+
+| 场景 | 结果 |
+|---|---|
+| 直连 4 流 | 3.77 Gbit/s，dpd `redirect_ok` +141,559 |
+| 直连 64 流 | eth2/eth3 = 1.85:1（接近自动权重 2:1） |
+| `ifdown wan` | 切到 eth3，模式仍 `stateful`，8 流 `redirect_ok` +123,643 |
+| 显式 `-> proxy` 的目标 | sender 324 MB / receiver 0（无节点，按预期失败）；dpd observe 下只 +14 包 |
+| 显式 `-> block` 的目标 | 连接被丢弃（iperf 控制连接失败） |
+| 同目标的直连端口 | 3.6 Gbit/s，正常加速 |
+
+边界：代理流本身仍由 honk 的 `wan_interface: auto` 单接口出去，不参与多 WAN；
+要代理也分流，得改 honk 自己的出口选择。
 
 ### 7.2 端口转发的 hairpin（LAN → WAN IP）
 
