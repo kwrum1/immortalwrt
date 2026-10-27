@@ -33,5 +33,17 @@
 		"depends": {
 			"uci": { "router_qos": true }
 		}
+	},
+	"admin/network/mwan": {
+		"title": "\u591A WAN",
+		"order": 73,
+		"action": {
+			"type": "view",
+			"path": "mydist/mwan"
+		},
+		"depends": {
+			"acl": [ "luci-app-mydist" ],
+			"uci": { "mydist_mwan": true }
+		}
 	}
 }

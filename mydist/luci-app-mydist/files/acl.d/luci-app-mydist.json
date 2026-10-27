@@ -1,0 +1,25 @@
+{
+	"luci-app-mydist": {
+		"description": "mydist pages: multi-WAN configuration and status",
+		"read": {
+			"ubus": {
+				"network.interface": [ "dump" ],
+				"network.device": [ "status" ],
+				"service": [ "list" ]
+			},
+			"uci": [ "mydist_mwan", "network" ],
+			"file": {
+				"/var/run/mydist-mwan/wans": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "mydist_mwan" ],
+			"file": {
+				"/sbin/uci commit mydist_mwan": [ "exec" ],
+				"/etc/init.d/mydist-mwan reload": [ "exec" ],
+				"/etc/init.d/mydist-mwan restart": [ "exec" ],
+				"/etc/init.d/mydist-mwan stop": [ "exec" ]
+			}
+		}
+	}
+}

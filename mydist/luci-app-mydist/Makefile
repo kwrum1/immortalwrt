@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-mydist
-PKG_VERSION:=0.5.0
+PKG_VERSION:=0.6.0
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=mydist
@@ -25,6 +25,9 @@ define Package/luci-app-mydist/description
                             inbound and is not exposed in the UI)
     * Network -> DNS       (SmartDNS, the only resolver; it owns :53)
     * Network -> 代理      (honk)
+    * Network -> QoS       (CAKE on the uplink)
+    * Network -> 多 WAN    (per-flow load balancing over several netifd WANs;
+                            weight, health target and up/counter status)
     * Network -> DHCP      (stock page, dnsmasq half hidden, odhcpd only)
 
   dnsmasq is not a resolver here and is stopped by mydist-posture.
@@ -40,6 +43,9 @@ define Package/luci-app-mydist/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/mydist
 	$(INSTALL_DATA) ./files/htdocs/luci-static/resources/view/mydist/firewall.js $(1)/www/luci-static/resources/view/mydist/firewall.js
 	$(INSTALL_DATA) ./files/htdocs/luci-static/resources/view/mydist/qos.js $(1)/www/luci-static/resources/view/mydist/qos.js
+	$(INSTALL_DATA) ./files/htdocs/luci-static/resources/view/mydist/mwan.js $(1)/www/luci-static/resources/view/mydist/mwan.js
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) ./files/acl.d/luci-app-mydist.json $(1)/usr/share/rpcd/acl.d/luci-app-mydist.json
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/99-luci-mydist-trim $(1)/etc/uci-defaults/99-luci-mydist-trim
 	$(INSTALL_DIR) $(1)/etc/init.d
