@@ -53,7 +53,7 @@ CI 只对 **X86 / ROCKCHIP** 使用这个分支；IPQ / MTK 仍构建上游的 `
 | **router-tuning** | 本仓库，纯脚本 | 首启按 CPU/内存/网卡选档：BBR、`fq`、sysctl、ring/coalescing、XPS、governor | 不替换 qdisc；只调内核与网卡参数 | 所有写入都在**运行期**，不动 `/etc/config/{network,dhcp,firewall}` |
 | **router-dns** | 本仓库，纯脚本 | **SmartDNS 独占 :53**；dnsmasq 端口 0 并停用；`router-dns-sync` 把 DHCP 学到的真实上游（非本机）写成 `server` 段，DoT 作为并行上游；`/tmp/resolv.conf` → `127.0.0.1`；`.lan` 名字写进 `hosts.lan`；honk 的 DNS 交接 | 替换 dnsmasq 的解析角色 | dnsmasq 只保留二进制，不再监听；上游**从租约派生**而不是写死，自身地址一律过滤 |
 | **luci-front** | 本仓库；Rust + pingora 0.9，静态 musl，预编译（x86_64 / aarch64） | :80/:443：HTTP/2、TLS、HSTS/CSP/X-Frame-Options/X-Content-Type-Options、静态 ETag/304；`/cgi-bin`、`/ubus` 反代 uhttpd | 替换 uhttpd 的对外监听 | uhttpd 退到 `127.0.0.1:8080`，只保留 Lua CGI 与 ubus 桥 |
-| **luci-app-mydist** | 本仓库 | 菜单（DNS/代理/防火墙/QoS）、五元组端口控制（单行表格）、QoS 页、`mydist-posture` | 替换原版 firewall/smartdns/honk 菜单入口 | `rule 999` 默认开启且不在 UI 显示；保存端口行时自动补 `src=wan/dest=lan/target=DNAT` 并丢弃未填完的行 |
+| **luci-app-mydist** | 本仓库 | 菜单（DNS/代理/防火墙/QoS/多 WAN）、五元组端口控制（单行表格）、QoS 页、多 WAN 配置与状态页、`mydist-posture` | 替换原版 firewall/smartdns/honk 菜单入口 | `rule 999` 默认开启且不在 UI 显示；保存端口行时自动补 `src=wan/dest=lan/target=DNAT` 并丢弃未填完的行；多 WAN 用法见 [`docs/multi-wan.md`](docs/multi-wan.md) |
 
 ---
 

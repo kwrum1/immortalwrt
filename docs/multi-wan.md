@@ -79,7 +79,9 @@ config interface 'wan2'
    - **WAN 接口**：下拉选择 netifd 接口（`wan`、`wan2`……），也可以直接输入；
    - **权重**：1–8，默认 1；
    - **启用**：单条 WAN 的开关；
-   - **健康目标**：留空用该 WAN 的网关；建议填一个从这条线能 ping 通的公网地址；
+   - **健康目标**：留空用该 WAN 的网关；PPPoE 接口没有默认网关时 daemon
+     会退回 `1.1.1.1`，所以双 PPPoE 建议显式填写一个从这条线能 ping 通的
+     公网地址；
    - **状态**：只读，显示 `up/down`、设备名和该设备的累计 RX/TX 字节。
 3. 保存。页面会执行 `uci commit mydist_mwan`，然后
    `/etc/init.d/mydist-mwan restart`（关闭总开关时执行 `stop`）。
@@ -211,8 +213,9 @@ nft 逐包处理，不是选路。
   ingress 上装了 downlink 钩子，把已识别的包直接 redirect 到 LAN，这些包
   不会再经过 IFB/ingress 整形；强行加 IFB 还会和 router-acl/dpd 抢包。
 - 所以：**需要逐包下载限速时，先关掉 downlink 加速**（不要给该 WAN 挂
-  dpd 的 ingress 钩子，或停用 dpd 的 downlink），再在 WAN ingress 上做
-  整形。代价是下载不再走快路径。上传整形不需要关。
+  dpd 的 ingress 钩子；目前这条钩子由 `mydist-mwan reconcile` 自动挂上，
+  需要临时移除或改脚本跳过），再在 WAN ingress 上做整形。代价是下载不再
+  走快路径。上传整形不需要关。
 
 ### 5.3 NAT / 防火墙
 
