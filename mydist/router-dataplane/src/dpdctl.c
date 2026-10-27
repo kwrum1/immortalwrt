@@ -460,11 +460,16 @@ static int cmd_flows(int argc, char **argv)
 		if (!bpf_map_lookup_elem(fd, &k, &v)) {
 			uint64_t age_ms = flow_age_ms(v.last_seen_ms);
 
-			printf("%-10s fam=%u proto=%u egress=%-10s age=%llums "
+			printf("%-10s fam=%u proto=%u egress=%-10s wan=%u epoch=%u "
+			       "cls=%s age=%llums "
 			       "dmac=%02x:%02x:%02x:%02x:%02x:%02x "
 			       "smac=%02x:%02x:%02x:%02x:%02x:%02x%s\n",
 			       ifname(k.ifindex), k.family, k.proto,
 			       ifname(v.egress_ifindex),
+			       (unsigned)(v.wan & 0xff),
+			       (unsigned)((v.wan & DPD_FLOW_EPOCH_MASK) >> 8),
+			       (v.flags & DPD_FLOW_F_L2) ? "l2" :
+			       (v.flags & DPD_FLOW_F_DEV) ? "dev" : "neigh",
 			       (unsigned long long)age_ms,
 			       v.dmac[0], v.dmac[1], v.dmac[2],
 			       v.dmac[3], v.dmac[4], v.dmac[5],
