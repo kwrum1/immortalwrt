@@ -1,7 +1,19 @@
 'use strict';
 'require view';
 'require uci';
+'require rpc';
 'require ui';
+
+/* rpcd's uci.apply commits the session's staged changes and fires the
+ * config-change triggers (fw4 and the ACL guard reload themselves). It is
+ * called with rollback=false: LuCI's own uci.apply() helper asks for the
+ * rollback flow and then polls uci.confirm for up to ten seconds, which on
+ * this image fails with "no data" (ubus code 5). */
+var callApply = rpc.declare({
+	object: 'uci',
+	method: 'apply',
+	params: [ 'timeout', 'rollback' ]
+});
 
 /* Network -> 防火墙: five-tuple port control, one WAN redirect per row.
  *
@@ -10,11 +22,12 @@
  *     every option is inline (modalonly=false). With no modal-only field the
  *     dialog is an empty "Save / Dismiss" box -- exactly the extra click that
  *     made "添加" feel broken.
- *   - The old save path only called uci.save() (writes /tmp/.uci) and then
- *     reloaded fw4. fw4 reads /etc/config, so the row did not actually apply
- *     until something else committed it. Here every Save stages the rows
- *     through the LuCI uci RPC, then uci.save() + uci.apply() commits them
- *     and lets the config-change trigger reload fw4.
+ *   - The old save path only called uci.save() (writes the config delta) and
+ *     then reloaded fw4. fw4 reads /etc/config, so the row did not actually
+ *     apply until something else committed it. Here every Save stages the
+ *     rows through the LuCI uci RPC, then uci apply commits the session's
+ *     delta and fires the config-change triggers (fw4 reload, and the ACL
+ *     guard re-imports the port list).
  *
  * Rows are written through the uci RPC (the ACL-covered path, not /sbin/uci).
  * src=wan, dest=lan and target=DNAT
@@ -359,9 +372,8 @@ return view.extend({
 			set('target', 'DNAT');
 		}
 
-		/* The writes go through the LuCI uci RPC, not /sbin/uci: that is the
-		 * path the page's ACL covers (write.uci firewall), and unlike
-		 * fs.exec() it does not need a shell command whitelist. */
+		/* Stage the ops through the LuCI uci RPC: it writes into the
+		 * session's config delta, which uci apply then commits. */
 		ops.forEach(function(o) {
 			if (o.op == 'remove') {
 				uci.remove('firewall', o.sid);
@@ -375,10 +387,11 @@ return view.extend({
 			}
 		});
 
+		/* Commit + reload: uci apply runs the config-change triggers, so fw4
+		 * reloads and the ACL guard re-imports the ports without a shell
+		 * exec (rollback=false: no confirm timer, no 10 s stall). */
 		return uci.save().then(function() {
-			/* Commit and reload: uci apply runs the config-change triggers, so
-			 * fw4 reloads without a shell exec. */
-			return uci.apply();
+			return callApply(0, false);
 		}).then(function() {
 			return self.reload();
 		}).then(function() {

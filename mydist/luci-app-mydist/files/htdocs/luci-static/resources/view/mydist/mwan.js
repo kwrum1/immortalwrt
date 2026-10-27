@@ -36,6 +36,16 @@ var callDevices = rpc.declare({
 	expect: {}
 });
 
+/* rpcd's uci.apply commits the staged changes and fires the config-change
+ * triggers (mydist-mwan's reload trigger is "mydist_mwan"). rollback=false
+ * skips the confirm/rollback flow that LuCI's uci.apply() helper uses and
+ * that failed with "no data" (ubus code 5) on this image. */
+var callApply = rpc.declare({
+	object: 'uci',
+	method: 'apply',
+	params: [ 'timeout', 'rollback' ]
+});
+
 function fmtBytes(n) {
 	n = parseInt(n, 10) || 0;
 
@@ -201,14 +211,7 @@ return view.extend({
 					_('秒（1–3600）。常驻的 health 循环按这个间隔 ping 每条 WAN 的健康目标。')),
 
 				self.row(_('负载方式'), self.gMode,
-					_('自动：权重 = 本 WAN 带宽 / 最小带宽（1–8）。手动：直接使用每条 WAN 的“权重”。')),
-
-				E('div', { 'class': 'cbi-page-actions' }, [
-					E('button', {
-						'class': 'btn cbi-button cbi-button-apply',
-						click: function() { return self.saveGlobal(); }
-					}, [ _('保存并应用') ])
-				])
+					_('自动：权重 = 本 WAN 带宽 / 最小带宽（1–8）。手动：直接使用每条 WAN 的“权重”。'))
 			]),
 
 			E('div', { 'class': 'cbi-section' }, [
@@ -223,6 +226,16 @@ return view.extend({
 				E('div', { 'class': 'cbi-value-description' }, [
 					_('接口在表格里是锁定的，点“编辑”才能选择。新加的行在选好接口之前不会生效。')
 				])
+			]),
+
+			/* One save button for the whole page, at the bottom where the
+			 * eye lands after filling it in. Row edits apply from the edit
+			 * dialog itself, so this button writes the global block. */
+			E('div', { 'class': 'cbi-page-actions' }, [
+				E('button', {
+					'class': 'btn cbi-button cbi-button-apply',
+					click: function() { return self.saveGlobal(); }
+				}, [ _('保存并应用') ])
 			])
 		]);
 	},
@@ -345,26 +358,23 @@ return view.extend({
 		});
 
 		return uci.save().then(function() {
-			/* commit + config-change triggers */
-			return uci.apply();
-		}).then(function() {
-			if (opts.restart === false)
-				return;
-
-			/* restart, not reload: enabling after it was stopped has to
-			 * start the health loop, disabling has to clean the rules.
-			 * The two exact init commands are what the ACL grants; do not
-			 * wrap them in /bin/sh. */
-			var on = uci.get('mydist_mwan', 'global', 'enabled') == '1';
-
-			return fs.exec('/etc/init.d/mydist-mwan',
-				[ on ? 'restart' : 'stop' ]).catch(function() {});
+			/* Commit + config-change triggers (this also reloads
+			 * mydist-mwan, whose procd trigger names mydist_mwan).
+			 * rollback=false: LuCI's uci.apply() helper polls confirm
+			 * for ten seconds, which made the dialog feel stuck. */
+			return callApply(0, false);
 		}).then(function() { return self.reload(); })
 		.then(function() {
 			if (opts.closeModal)
 				ui.hideModal();
 			if (opts.notify)
 				ui.addNotification(null, E('p', {}, [ opts.notify ]), 'info');
+
+			/* The restart runs in the background; refresh the status
+			 * column once it has had time to reconcile. */
+			window.setTimeout(function() {
+				self.reload().catch(function() {});
+			}, 5000);
 		})
 		.catch(function(e) {
 			ui.addNotification(null, E('p', {}, [ e.message || String(e) ]), 'danger');
@@ -413,12 +423,12 @@ return view.extend({
 		} while (used[name]);
 
 		/* No dialog: the row appears at once and is inactive until an
-		 * interface is chosen here. Nothing to restart yet. */
+		 * interface is chosen here. */
 		return self.applyChanges([
 			[ 'set', 'mydist_mwan', name, 'wan' ],
 			[ 'set', 'mydist_mwan', name, 'enabled', '1' ],
 			[ 'set', 'mydist_mwan', name, 'weight', '1' ]
-		], { restart: false, notify: _('已添加接口行，点“编辑”选择 WAN 接口') });
+		], { notify: _('已添加接口行，点“编辑”选择 WAN 接口') });
 	},
 
 	removeUplink: function(sid) {

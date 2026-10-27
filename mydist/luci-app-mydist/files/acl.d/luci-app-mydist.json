@@ -15,16 +15,7 @@
 			}
 		},
 		"write": {
-			"ubus": {
-				"file": [ "write", "exec" ]
-			},
-			"uci": [ "mydist_mwan", "firewall" ],
-			"file": {
-				"/sbin/uci commit mydist_mwan": [ "exec" ],
-				"/etc/init.d/mydist-mwan reload": [ "exec" ],
-				"/etc/init.d/mydist-mwan restart": [ "exec" ],
-				"/etc/init.d/mydist-mwan stop": [ "exec" ]
-			}
+			"uci": [ "mydist_mwan", "firewall" ]
 		}
 	}
 }
