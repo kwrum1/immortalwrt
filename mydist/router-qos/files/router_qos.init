@@ -74,9 +74,9 @@ reload_service() {
 	start_service
 }
 
-extra_command "status" "Show the WAN qdisc and the filter chains sharing the device" || true
+extra_command "qdisc" "Show the WAN qdisc and the filter chains sharing the device" || true
 
-status() {
+qdisc() {
 	local dev
 
 	rq_load
