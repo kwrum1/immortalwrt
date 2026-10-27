@@ -5,14 +5,19 @@
 			"ubus": {
 				"network.interface": [ "dump" ],
 				"network.device": [ "status" ],
-				"service": [ "list" ]
+				"service": [ "list" ],
+				"file": [ "read" ]
 			},
 			"uci": [ "mydist_mwan", "network", "firewall" ],
 			"file": {
-				"/var/run/mydist-mwan/wans": [ "read" ]
+				"/var/run/mydist-mwan/wans": [ "read" ],
+				"/tmp/run/mydist-mwan/wans": [ "read" ]
 			}
 		},
 		"write": {
+			"ubus": {
+				"file": [ "write", "exec" ]
+			},
 			"uci": [ "mydist_mwan", "firewall" ],
 			"file": {
 				"/sbin/uci commit mydist_mwan": [ "exec" ],
