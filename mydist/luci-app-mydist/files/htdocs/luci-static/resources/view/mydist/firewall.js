@@ -53,6 +53,17 @@ function uciProto(v) {
 }
 
 return view.extend({
+	/* The LuCI view base class appends its own Save & Apply footer for every
+	 * view that inherits handleSaveApply(). That footer calls
+	 * ui.changes.apply() (the ubus/ACL path); this page writes through uci(1)
+	 * instead, so the extra button was both a duplicate and the source of the
+	 * "no permission" error. Shadow the three handlers with null so the base
+	 * footer is not rendered; the explicit button below the table is the only
+	 * one. */
+	handleSave: null,
+	handleSaveApply: null,
+	handleReset: null,
+
 	load: function() {
 		var self = this;
 
