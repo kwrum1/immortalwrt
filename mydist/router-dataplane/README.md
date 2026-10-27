@@ -137,6 +137,29 @@ IPv6 同理：本基线没有 NAT66（有意），回程没有 conntrack 状态�
 `/usr/libexec/dpd-gate-refresh` 回调），honk 没有。把它做成门禁就意味着「honk 来过
 一次之后 dpd 永远停在 observe」——比不加速更糟。所以只报告事实、不改变行为。
 
+### 2.2.2 honk p1：把直连判决交回 classic（2026-10-27）
+
+上游 core 的 direct 出口返回 `TC_ACT_OK`，所以上面那张表是准确的：直连也进不了
+classic。honk 包 **p1** 把 direct 出口改成 `TC_ACT_UNSPEC` + 专用 mark
+（`ci/patches/honk-direct-unspec.py`，不改上游仓库，只作为构建补丁）：
+
+| 流 | 判决 | dpd |
+|---|---|---|
+| direct（含 must/offload） | `UNSPEC` + `DIRECT_UNSPEC_MARK` | **进入 classic，正常加速** |
+| proxy | redirect 到 `dae0` | 不进 classic |
+| block | `SHOT` | 不进 classic |
+
+门控用 `/usr/share/honk/direct-unspec` 识别 p1；没有这个 marker（上游原版 core）
+仍然降为 `observe`，避免用不完整的流表去加速 WAN 回程（实测强制 stateful 会把
+TCP 控制连接打断）。
+
+实测（实验台，honk 运行中，p1）：直连 4 流 3.77 Gbit/s，`redirect_ok` +141,559；
+64 流 eth2/eth3 = 1.85:1；`ifdown wan` 切到 eth3 且保持 stateful；显式
+`-> proxy` 的目标在 dpd observe 下只 +14 包（不进 classic）；同目标直连端口
+3.6 Gbit/s 正常加速；NAT 仍是 einat。
+
+代理流本身仍由 honk 的 `wan_interface` 单接口出去，不参与多 WAN。
+
 ### 2.3 策略：哪些段允许被加速（`option policy` + `option vlans`）
 
 | policy | 含义 |
