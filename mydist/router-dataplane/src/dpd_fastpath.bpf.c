@@ -430,8 +430,8 @@ static __always_inline int dpd_pick_wan(const struct dpd_flow_key *k)
 		__u32 wt = w->weight;					\
 		if (wt > DPD_WAN_WMAX)					\
 			wt = DPD_WAN_WMAX;				\
-		DPD_REP(i,0) DPD_REP(i,1) DPD_REP(i,2) DPD_REP(i,3)	\
-		DPD_REP(i,4) DPD_REP(i,5) DPD_REP(i,6) DPD_REP(i,7)	\
+		DPD_REP(i,0); DPD_REP(i,1); DPD_REP(i,2); DPD_REP(i,3);	\
+		DPD_REP(i,4); DPD_REP(i,5); DPD_REP(i,6); DPD_REP(i,7);	\
 	}								\
 } while (0)
 	DPD_PICK(0); DPD_PICK(1); DPD_PICK(2); DPD_PICK(3);
