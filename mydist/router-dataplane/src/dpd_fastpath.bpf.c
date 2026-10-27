@@ -795,6 +795,15 @@ int dpd_fastpath(struct __sk_buff *skb)
 						}
 						if (ret < 0)
 							return TC_ACT_UNSPEC;
+						if (w.flags & DPD_WAN_F_L3) {
+							/* ppp/tun: no L2 header to write */
+							if (bpf_redirect(egress, 0) ==
+							    TC_ACT_REDIRECT) {
+								stat_add(ST_REDIRECT_OK, 1);
+								return TC_ACT_REDIRECT;
+							}
+							return TC_ACT_UNSPEC;
+						}
 						ret = dpd_emit_l2(skb, egress, w.gw_mac,
 								  w.dev_mac);
 						if (ret == TC_ACT_REDIRECT)

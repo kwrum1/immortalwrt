@@ -272,6 +272,7 @@ struct dpd_flow_val {
  */
 #define DPD_WAN_MAX	8
 #define DPD_WAN_F_UP	0x1
+#define DPD_WAN_F_L3	0x2	/* no L2 header: ppp/tun, use bpf_redirect */
 
 struct dpd_wan {
 	__u32	ifindex;
