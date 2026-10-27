@@ -7,6 +7,31 @@
 #   /etc/init.d/router-qos
 #   /etc/hotplug.d/iface/92-router-qos
 #
+# One algorithm, chosen automatically
+# -----------------------------------
+# There is nothing to configure here and nothing in the UI. The box picks the
+# best scheduler the running kernel offers, in this order:
+#
+#   cake      diffserv4 + nat        full flow isolation, DSCP tins, AQM
+#   fq_codel                         per-flow fairness + AQM (no tins)
+#
+# Whichever one is installed is logged, so the choice is visible in `logread`
+# without exposing a knob that can silently make latency worse.
+#
+# Why there is no `bandwidth` argument
+# ------------------------------------
+# CAKE with a `bandwidth` is a shaper: it makes the link look slower than it is
+# so that its own queue, rather than the driver's, is the one that fills. That
+# needs the operator to type their real uplink rate, and a wrong number is worse
+# than no shaper at all -- too high and the queue never fills (no effect), too
+# low and the link is needlessly throttled.
+#
+# This firmware does not ask. CAKE runs unlimited: no rate, no per-packet
+# framing/MPU arithmetic, just flow isolation and AQM. The queue that matters on
+# a home uplink is at the ISP end anyway, and the local queue still needs
+# fairness (one bulk transfer must not starve a game) and AQM (drop/mark early
+# instead of letting the driver queue grow to seconds). Unlimited CAKE does both.
+#
 # Why there is no classifier program here
 # ---------------------------------------
 # The old shape of this was HTB plus a cascade of `tc filter` classifiers, one
@@ -14,7 +39,7 @@
 # with a single qdisc that does its own per-flow fairness, its own ack
 # filtering and its own DSCP->tin mapping. So the whole QoS is one qdisc:
 #
-#   tc qdisc replace dev <wan> root cake bandwidth <upload>kbit ...
+#   tc qdisc replace dev <wan> root cake diffserv4 nat
 #
 # That is the "single TC program + CAKE" from the plan, taken literally.
 #
@@ -46,9 +71,8 @@
 # and fw4 forward would drop it.
 #
 # So: upload only. On a home link the upload really is the queue this box owns
-# -- the downstream is queued at the ISP's end, which is exactly why tuning it
-# means pretending the link is slower than it is. Shaping the direction the
-# router actually controls is the honest half, and it is the half that needs no
+# -- the downstream is queued at the ISP's end. Fairness and AQM on the half the
+# router actually transmits is the honest half, and it is the half that needs no
 # IFB, no extra filter and no interference with the eBPF datapath.
 #
 # Interaction with the other TC users on the WAN device
@@ -78,45 +102,45 @@ rq_resolve_dev() {
 	return 1
 }
 
-rq_cake_opts() {
-	local bw="$1" overhead="$2" mpu="$3" diffserv="$4" wash="$5" nat="$6"
-	local opts="bandwidth ${bw}kbit"
+# Every device named by RQ_WAN (space separated, so multi-WAN just lists the
+# logical interfaces), resolved and de-duplicated. Missing ones are skipped:
+# a PPPoE device does not exist until the link is up, and the hotplug script
+# applies the qdisc then.
+rq_all_devs() {
+	local want dev
 
-	[ "${overhead:-0}" != "0" ] && opts="$opts overhead $overhead"
-	[ "${mpu:-0}" != "0" ] && opts="$opts mpu $mpu"
-	case "$diffserv" in
-	''|none)	;;
-	*)		opts="$opts $diffserv" ;;
-	esac
-	[ "$wash" = "1" ] && opts="$opts wash"
-	[ "$nat" = "1" ] && opts="$opts nat"
-	printf '%s' "$opts"
+	for want in $RQ_WAN; do
+		dev="$(rq_resolve_dev "$want")" || continue
+		echo "$dev"
+	done | awk '!seen[$0]++'
 }
 
-# The one maintained policy. The UI deliberately does not expose the kernel
-# knobs: a home router has one right answer here, and a wrong `overhead` or a
-# disabled DSCP map only shows up as "why is my latency bad".
-#
-#   diffserv4  four tins (Bulk / Best Effort / Video / Voice). besteffort would
-#              throw away the priority mapping that makes CAKE useful.
-#   nat        this box NATs everything on the WAN; without `nat` CAKE cannot
-#              keep both directions of a flow in the same tin.
-#   overhead   inferred from the device when the operator left it at 0:
-#              ppp* / tun* = 34 (PPPoE over Ethernet with the VLAN tag), plain
-#              Ethernet keeps 0 (the kernel already accounts for it).
-#   wash       left as configured (0 by default: trust LAN DSCP, as the docs
-#              argued), because washing silently downgrades local markings.
+# The maintained policy. `nat` keeps both directions of a NATed flow in the same
+# tin; `diffserv4` keeps the four tins (Bulk / Best Effort / Video / Voice).
+# No `bandwidth`, so this is the unlimited scheduler: fairness and AQM only.
 rq_best_opts() {
-	local dev="$1" bw="$2" overhead="$3" mpu="$4" diffserv="$5" wash="$6" nat="$7"
+	printf '%s' 'diffserv4 nat'
+}
 
-	case "$diffserv" in
-	''|none) diffserv="diffserv4" ;;
-	esac
-	nat="1"
-	case "$dev" in
-	ppp*|tun*|wg*) [ "${overhead:-0}" = "0" ] && overhead=34 ;;
-	esac
-	rq_cake_opts "$bw" "$overhead" "$mpu" "$diffserv" "$wash" "$nat"
+# When multi-WAN load balancing is on, its uplinks get the same qdisc -- one
+# uplink shaped and another not would just move the queue to the unshaped one.
+# Run inside $(...) so it cannot disturb the caller's config_load state.
+rq_mwan_devs() {
+	local on
+
+	config_load mydist_mwan 2>/dev/null || return 0
+	config_get on global enabled 0
+	[ "$on" = "1" ] || return 0
+	config_foreach rq_mwan_one wan
+}
+
+rq_mwan_one() {
+	local ifn
+
+	config_get ifn "$1" interface
+	config_get_bool on "$1" enabled 1
+	[ "$on" = "1" ] && [ -n "$ifn" ] && echo "$ifn"
+	return 0
 }
 
 rq_apply() {
@@ -124,7 +148,7 @@ rq_apply() {
 
 	[ -e "/sys/class/net/$dev" ] || return 1
 	if tc qdisc replace dev "$dev" root cake $opts 2>/dev/null; then
-		rq_log "apply: cake on $dev ($opts)"
+		rq_log "apply: cake $opts on $dev"
 		return 0
 	fi
 	# No cake module (or a kernel that rejects the options): keep per-flow
@@ -152,13 +176,13 @@ rq_enabled_qdisc() {
 	local dev="$1"
 
 	[ -e "/sys/class/net/$dev" ] || return 1
-	tc qdisc show dev "$dev" 2>/dev/null | grep -qE '(^| )cake( |$)'
+	tc qdisc show dev "$dev" 2>/dev/null | grep -qE '(^| )(cake|fq_codel)( |$)'
 }
 
 rq_status() {
 	local dev="$1"
 
-	echo "--- root qdisc on $dev ---"
+	echo "--- root qdisc on ${dev:-<unresolved>} ---"
 	if [ -z "$dev" ]; then
 		echo "  (WAN device not resolved)"
 		return 0

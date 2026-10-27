@@ -34,13 +34,19 @@ define Package/router-qos
 endef
 
 define Package/router-qos/description
-  CAKE QoS for the WAN upload.
+  QoS for the WAN upload, with nothing to configure.
 
-    tc qdisc replace dev <wan> root cake bandwidth <upload>kbit ...
+    tc qdisc replace dev <wan> root cake diffserv4 nat
 
-  One qdisc, no classes, no filter cascade: CAKE does the per-flow fairness and
-  the DSCP->tin mapping itself. It replaces the old HTB + classifier-cascade
-  shape rather than adding another program to the datapath.
+  One qdisc, no classes, no rate, no filter cascade: CAKE does the per-flow
+  fairness, the AQM and the DSCP->tin mapping itself. It runs unlimited rather
+  than shaped to an operator-supplied bandwidth, because a wrong rate is worse
+  than no shaper. If the kernel has no cake module the same script installs
+  fq_codel, so fairness and AQM survive.
+
+  Enabled by default; the only uci entries are `enabled` and `wan` (a list, so
+  multi-WAN uplinks are covered, automatically including the ones mydist_mwan
+  load balances over).
 
   A root qdisc and the clsact qdisc that router-acl creates are independent
   (clsact lives at handle ffff:), so replacing root does not disturb the
@@ -50,13 +56,6 @@ define Package/router-qos/description
   and on this device a mirror leaves the real packet unshaped while a redirect
   either starves router-acl/dpd or breaks fw4's zone matching -- the long
   version, with the measurement, is in files/router-qos.sh.
-
-  Default is enabled 0, and it refuses to start with upload=0: there would be
-  nothing to shape and a stray qdisc is only a surprise.
-
-  `nat 1` uses conntrack to keep a flow in one tin in both directions. Leave it
-  0 when router-acl runs in bypass mode, because bypass is precisely the removal
-  of that conntrack entry.
 endef
 
 define Package/router-qos/conffiles

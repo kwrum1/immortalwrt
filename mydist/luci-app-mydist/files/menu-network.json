@@ -23,19 +23,8 @@
 			"uci": { "honk": true }
 		}
 	},
-	"admin/network/qos": {
-		"title": "QoS",
-		"order": 72,
-		"action": {
-			"type": "view",
-			"path": "mydist/qos"
-		},
-		"depends": {
-			"uci": { "router_qos": true }
-		}
-	},
 	"admin/network/mwan": {
-		"title": "\u591A WAN",
+		"title": "\u591A WAN \u8D1F\u8F7D",
 		"order": 73,
 		"action": {
 			"type": "view",
