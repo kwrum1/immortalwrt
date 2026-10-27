@@ -106,6 +106,9 @@ define Package/dpd-fastpath/install
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/dpd_fastpath.bpf.o $(1)/lib/bpf/
 
 	$(INSTALL_BIN) ./files/dpd_fastpath.init $(1)/etc/init.d/dpd-fastpath
+	$(INSTALL_BIN) ./files/mydist-mwan $(1)/usr/libexec/mydist-mwan
+	$(INSTALL_BIN) ./files/mydist-mwan.init $(1)/etc/init.d/mydist-mwan
+	$(INSTALL_DATA) ./files/mydist_mwan.config $(1)/etc/config/mydist_mwan
 	$(INSTALL_DATA) ./files/dpd-fastpath.sh $(1)/usr/libexec/dpd-fastpath.sh
 	$(INSTALL_BIN) ./files/dpd-gate-refresh $(1)/usr/libexec/dpd-gate-refresh
 	$(INSTALL_BIN) ./files/dpd-gate-watchdog $(1)/usr/libexec/dpd-gate-watchdog
