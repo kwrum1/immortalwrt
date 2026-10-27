@@ -389,29 +389,54 @@ static __always_inline int dpd_is_uplink(__u32 ifindex)
  * removing a WAN, or changing a weight, only moves the flows that hash to the
  * affected node, and the choice is a pure function of the 5-tuple, so two
  * packets of one flow never disagree.
+ *
+ * Weighting is done with replicated draws, not by scaling the score. Draw
+ * `weight` independent hashes per uplink and let the highest of them all win:
+ * with w_i iid uniforms, uplink i owns the global maximum with probability
+ * exactly w_i / sum(w). The previous `score = hash * weight` did NOT do that
+ * -- for 2:1 it yields P = 1 - 1/(2*2) = 0.75, i.e. 3:1 (simulated over 6506
+ * ports: 74.8% / 25.2%), 50% off the configured ratio. `hash^(1/w)` would be
+ * exact too but there is no pow() in BPF, and this only runs on a flow miss.
  */
+#define DPD_WAN_WMAX 8
+
+static __always_inline __u32 dpd_pick_hash(const struct dpd_flow_key *k,
+					   __u32 slot)
+{
+	return dpd_flow_hash(k, 0x9e3779b9u * (slot + 1));
+}
+
 static __always_inline int dpd_pick_wan(const struct dpd_flow_key *k)
 {
 	struct dpd_wan_tbl *t = dpd_wan_tbl();
-	__u64 best = 0;
+	__u32 best = 0;
 	int best_i = -1;
 
 	if (!t)
 		return -1;
+#define DPD_REP(i, j) do {						\
+	if ((j) < wt) {							\
+		__u32 hh = dpd_pick_hash(k, (i) * DPD_WAN_WMAX + (j));	\
+		if (hh > best) {					\
+			best = hh;					\
+			best_i = (i);					\
+		}							\
+	}								\
+} while (0)
 #define DPD_PICK(i) do {						\
 	struct dpd_wan *w = &t->wan[i];					\
 	if ((i) < t->count && w->ifindex && w->weight &&		\
 	    (w->flags & DPD_WAN_F_UP)) {				\
-		__u32 h = dpd_flow_hash(k, 0x9e3779b9u * ((i) + 1));	\
-		__u64 score = (__u64)h * w->weight;			\
-		if (score > best) {					\
-			best = score;					\
-			best_i = i;					\
-		}							\
+		__u32 wt = w->weight;					\
+		if (wt > DPD_WAN_WMAX)					\
+			wt = DPD_WAN_WMAX;				\
+		DPD_REP(i,0) DPD_REP(i,1) DPD_REP(i,2) DPD_REP(i,3)	\
+		DPD_REP(i,4) DPD_REP(i,5) DPD_REP(i,6) DPD_REP(i,7)	\
 	}								\
 } while (0)
 	DPD_PICK(0); DPD_PICK(1); DPD_PICK(2); DPD_PICK(3);
 	DPD_PICK(4); DPD_PICK(5); DPD_PICK(6); DPD_PICK(7);
+#undef DPD_REP
 #undef DPD_PICK
 	return best_i;
 }

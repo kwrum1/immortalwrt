@@ -373,33 +373,47 @@ einat_instance() {
 # service_data() is also why the `firewall` array is added directly: procd has
 # already opened the enclosing `data` object for us.
 service_data() {
-	local wandev landev
+	local wandev landev lanzone zone zones
 
 	[ -n "$EINAT_DEVS" ] || return 0
 	landev="$(fw4_device "${lan_iface:-lan}")"
 	[ -n "$landev" ] || { logger -t einat "no LAN device; no firewall overrides"; return 1; }
+	lanzone="$(fw4 device "$landev" 2>/dev/null)"
+	[ -n "$lanzone" ] || lanzone="${lan_iface:-lan}"
 
+	# fw4's ubus rule schema takes ZONE names for src/dest (parse_zone_ref),
+	# not devices: passing the device only produced
+	#   `ubus rule (...) option 'src' specifies invalid value 'eth2'`
+	# and the rule was dropped. The zone is looked up from the device so a
+	# renamed uplink still lands in the right place. One override per zone;
+	# every uplink einat covers normally lives in the same wan zone.
 	json_add_array firewall
+	zones=""
 	for wandev in $EINAT_DEVS; do
+		zone="$(fw4 device "$wandev" 2>/dev/null)"
+		[ -n "$zone" ] || { logger -t einat "no firewall zone covers $wandev"; continue; }
+		case " $zones " in *" $zone "*) continue ;; esac
+		zones="$zones $zone"
+
 		# einat's external port range must be reachable from outside
 		json_add_object ''
 		json_add_string type rule
 		json_add_string target 'ACCEPT'
-		json_add_string name "einat: forward $wandev to lan"
+		json_add_string name "einat: forward $zone to $lanzone"
 		json_add_string family 'ipv4'
 		json_add_string proto 'tcp udp icmp'
-		json_add_string src "$wandev"
-		json_add_string dest "$landev"
+		json_add_string src "$zone"
+		json_add_string dest "$lanzone"
 		json_close_object
 		# einat IS the NAT: masquerading has to go, otherwise the return
 		# path gets rewritten by conntrack and full-cone is lost
 		json_add_object ''
 		json_add_string type nat
 		json_add_string target 'ACCEPT'
-		json_add_string name "einat: disable masquerade on $wandev"
+		json_add_string name "einat: disable masquerade on $zone"
 		json_add_string family 'ipv4'
 		json_add_string proto 'tcp udp icmp'
-		json_add_string src "$wandev"
+		json_add_string src "$zone"
 		json_close_object
 	done
 	json_close_array
