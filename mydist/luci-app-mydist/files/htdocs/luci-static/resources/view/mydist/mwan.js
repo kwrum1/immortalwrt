@@ -461,10 +461,24 @@ return view.extend({
 			var b = String(bw.value).trim();
 			var w = String(wt.value).trim();
 			var h = String(hl.value).trim();
+			var dup = null;
 			var cmds;
 
 			if (!ifn)
 				return ui.addNotification(null, E('p', {}, [ _('请选择 WAN 接口') ]), 'danger');
+
+			/* One uplink, one row: two rows on the same interface would each
+			 * get their own einat instance and fwmark table. */
+			uci.sections('mydist_mwan', 'wan', function(sec) {
+				if (sec['.name'] != sid && (sec.interface || '') == ifn)
+					dup = sec['.name'];
+			});
+
+			if (dup)
+				return ui.addNotification(null, E('p', {}, [
+					_('接口 %s 已经被另一行使用（%s）').format(ifn, dup)
+				]), 'danger');
+
 			if (!/^[1-8]$/.test(w))
 				return ui.addNotification(null, E('p', {}, [ _('权重必须是 1–8 的整数') ]), 'danger');
 			if (b !== '' && (!/^[0-9]+$/.test(b) || parseInt(b, 10) < 1 || parseInt(b, 10) > 100000))
