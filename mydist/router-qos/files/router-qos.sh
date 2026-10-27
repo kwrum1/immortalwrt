@@ -10,13 +10,16 @@
 # One algorithm, chosen automatically
 # -----------------------------------
 # There is nothing to configure here and nothing in the UI. The box picks the
-# best scheduler the running kernel offers, in this order:
+# best scheduler it can afford, in this order:
 #
-#   cake      diffserv4 + nat        full flow isolation, DSCP tins, AQM
-#   fq_codel                         per-flow fairness + AQM (no tins)
+#   cake      diffserv4 + nat        tins + flow isolation + AQM   (<= 1 Gbit/s)
+#   fq_codel                         flow isolation + AQM          (faster links)
 #
-# Whichever one is installed is logged, so the choice is visible in `logread`
-# without exposing a knob that can silently make latency worse.
+# cake does more work per packet. At gigabit and below that cost is invisible;
+# on a 10G link it is not (measured here: 4.7 -> 2.8 Gbit/s with 8 flows), so
+# fast links get fq_codel instead. Whichever one is installed is logged, so the
+# choice is visible in `logread` without exposing a knob that can silently make
+# latency worse.
 #
 # Why there is no `bandwidth` argument
 # ------------------------------------
@@ -122,6 +125,40 @@ rq_best_opts() {
 	printf '%s' 'diffserv4 nat'
 }
 
+# cake is the better scheduler (DSCP tins), but its per-packet work is real: on
+# this lab's 10G links, 8 flows went 4.7 -> 2.8 Gbit/s. That is a VM with a
+# GSO-capable NIC, and the same tax shows up on any NIC that hands the qdisc
+# large super-packets. At home-link rates it is noise, so the qdisc is picked
+# from the link rate rather than from the hardware:
+#
+#   <= 1000 Mbit/s, or unknown   cake   (tins + fairness + AQM)
+#   >  1000 Mbit/s               fq_codel (fairness + AQM, no tins)
+#
+# A PPPoE device usually has no speed file; unknown therefore means "home link"
+# and gets cake. This keeps the choice automatic and identical on x86 and ARM.
+RQ_CAKE_MAX_SPEED=1000
+
+rq_link_speed() {
+	local sp
+
+	sp="$(cat "/sys/class/net/$1/speed" 2>/dev/null)"
+	case "$sp" in
+	''|*[!0-9]*) sp=0 ;;
+	esac
+	printf '%s' "$sp"
+}
+
+rq_pick_qdisc() {
+	local sp
+
+	sp="$(rq_link_speed "$1")"
+	if [ "$sp" -eq 0 ] || [ "$sp" -le "$RQ_CAKE_MAX_SPEED" ]; then
+		printf 'cake'
+	else
+		printf 'fq_codel'
+	fi
+}
+
 # When multi-WAN load balancing is on, its uplinks get the same qdisc -- one
 # uplink shaped and another not would just move the queue to the unshaped one.
 # Run inside $(...) so it cannot disturb the caller's config_load state.
@@ -144,17 +181,18 @@ rq_mwan_one() {
 }
 
 rq_apply() {
-	local dev="$1" opts="$2"
+	local dev="$1" q
 
 	[ -e "/sys/class/net/$dev" ] || return 1
-	if tc qdisc replace dev "$dev" root cake $opts 2>/dev/null; then
-		rq_log "apply: cake $opts on $dev"
+	q="$(rq_pick_qdisc "$dev")"
+	if [ "$q" = "cake" ] && tc qdisc replace dev "$dev" root cake $(rq_best_opts) 2>/dev/null; then
+		rq_log "apply: cake $(rq_best_opts) on $dev"
 		return 0
 	fi
-	# No cake module (or a kernel that rejects the options): keep per-flow
-	# fairness instead of leaving the device on its default queue.
+	# cake unavailable, or link faster than cake can keep up with: per-flow
+	# fairness and AQM without the DSCP tins.
 	if tc qdisc replace dev "$dev" root fq_codel 2>/dev/null; then
-		rq_log "apply: cake unavailable on $dev, fell back to fq_codel"
+		rq_log "apply: fq_codel on $dev (link $(rq_link_speed "$dev") Mbit/s)"
 		return 0
 	fi
 	rq_log "apply: neither cake nor fq_codel worked on $dev"

@@ -36,13 +36,15 @@ endef
 define Package/router-qos/description
   QoS for the WAN upload, with nothing to configure.
 
-    tc qdisc replace dev <wan> root cake diffserv4 nat
+  One root qdisc, no classes, no rate, no filter cascade. It runs unlimited
+  rather than shaped to an operator-supplied bandwidth, because a wrong rate is
+  worse than no shaper; the queue that matters on a home uplink is the ISP's,
+  while the local queue still needs fairness and AQM.
 
-  One qdisc, no classes, no rate, no filter cascade: CAKE does the per-flow
-  fairness, the AQM and the DSCP->tin mapping itself. It runs unlimited rather
-  than shaped to an operator-supplied bandwidth, because a wrong rate is worse
-  than no shaper. If the kernel has no cake module the same script installs
-  fq_codel, so fairness and AQM survive.
+  The scheduler is picked from the link rate, not from the hardware: cake
+  diffserv4 + nat up to 1 Gbit/s, fq_codel above that (cake's per-packet cost is
+  no longer free at multi-gigabit rates) and whenever the kernel has no cake
+  module. Both give per-flow fairness and AQM; only cake has DSCP tins.
 
   Enabled by default; the only uci entries are `enabled` and `wan` (a list, so
   multi-WAN uplinks are covered, automatically including the ones mydist_mwan

@@ -48,7 +48,7 @@ ifup|ifupdate|add|update)
 	[ -n "$DEVICE" ] || exit 0
 	rq_selected || exit 0
 
-	rq_apply "$DEVICE" "$(rq_best_opts "$DEVICE")"
+	rq_apply "$DEVICE"
 	rq_log "hotplug $ACTION $INTERFACE -> $DEVICE applied"
 	;;
 ifdown|remove)

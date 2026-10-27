@@ -54,7 +54,7 @@ start_service() {
 
 	for dev in $(rq_all_devs); do
 		found=1
-		rq_apply "$dev" "$(rq_best_opts "$dev")"
+		rq_apply "$dev"
 	done
 	[ "$found" = "1" ] || rq_log "WAN '$RQ_WAN' has no device yet; hotplug will retry on ifup"
 }
