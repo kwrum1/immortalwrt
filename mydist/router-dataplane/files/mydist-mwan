@@ -154,6 +154,10 @@ reconcile() {
 	if [ -e "$PIN_WAN" ]; then
 		bpftool map update pinned "$PIN_WAN" key 0 0 0 0 value $val >/dev/null 2>&1 \
 			&& log "dpd_wans: $count uplink(s)" || log "dpd_wans update failed"
+		# Every cached flow was pinned to an uplink and a pair of MACs from the
+		# old table. Bump the generation so the next packet of each flow is
+		# re-learned against the new one (and re-marked into the new table).
+		/usr/sbin/dpdctl bump >/dev/null 2>&1
 	else
 		log "dpd_wans map not pinned (is dpd attached?)"
 	fi

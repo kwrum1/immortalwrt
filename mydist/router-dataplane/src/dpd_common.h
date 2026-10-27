@@ -86,8 +86,28 @@
  *    running. Priming costs two packets per flow, makes the entry reach
  *    ESTABLISHED, and keeps nf_conntrack_count / `ct state` rules / the
  *    transition back to the slow path meaningful. No value-layout change: the
- *    counter lives in the spare high byte of dpd_flow_val.flags. */
-#define DPD_ABI_VERSION		8
+ *    counter lives in the spare high byte of dpd_flow_val.flags.
+ *
+ * 9: the 2026-10-28 review pass (correctness + per-packet cost):
+ *      - dpd_stats is ONE per-CPU block (struct dpd_stat_val) instead of
+ *        ST__MAX array keys: the packet path used to do 5 map lookups, now 1.
+ *      - dpd_cfg gains `epoch` and `flow_refresh_ms`. The epoch is a flow-cache
+ *        generation; the control plane bumps it on any topology change (link
+ *        up/down, address/route/neighbour change, WAN re-pick). A cached entry
+ *        from another epoch is ignored and re-learned. That is what lets the
+ *        hit path drop its per-packet dpd_iface / dpd_wans re-validation.
+ *      - dpd_flow_val records the *emit class* (L2 / dev / neigh) at learn
+ *        time, so a hit no longer looks up dpd_iface or re-decides.
+ *      - timestamps refresh at most once per flow_refresh_ms (0 = every
+ *        packet). Entries then live up to flow_refresh_ms *longer* than
+ *        flow_ttl_ms -- the error is always "cached too long", never "live
+ *        flow dropped".
+ *      - IPv4 GSO length comes from the real per-segment headers
+ *        (iph->ihl*4 + L4 header + gso_size), not from gso_size alone.
+ *      - IPv6, :53, DHCP and non-unicast packets are rejected *before* the
+ *        FIB lookup: they can never be accelerated, so they no longer pay for
+ *        a route lookup. */
+#define DPD_ABI_VERSION		9
 
 /* name of the TC section in the BPF object; dpdctl/init pass this to tc(8) */
 #define DPD_BPF_SECTION		"classifier"
@@ -142,7 +162,17 @@ struct dpd_config {
 	__u32	redirect;	/* enum dpd_redirect			*/
 	__u32	flow_ttl_ms;	/* Mode B entry freshness		*/
 	__u32	policy;		/* enum dpd_policy			*/
-	__u32	flags;		/* reserved				*/
+	/* Flow-cache generation. Userspace bumps it whenever a cached egress
+	 * may have become wrong (link up/down, address or route change, WAN
+	 * re-pick, neighbour flush). Entries store the epoch they were learned
+	 * in; a hit from another epoch is treated as a miss. 8 bits are kept in
+	 * dpd_flow_val.wan, so the comparison is one byte. */
+	__u32	epoch;
+	/* Refresh dpd_flow_val.last_seen_ms at most once per this many ms.
+	 * 0 = every packet (exact idle-timeout semantics). A non-zero value
+	 * keeps an idle entry alive for up to this much longer than
+	 * flow_ttl_ms, which is the safe direction. */
+	__u32	flow_refresh_ms;
 };
 
 enum dpd_stat_idx {
@@ -205,6 +235,18 @@ enum dpd_stat_idx {
  * padding, so the structure layout is unchanged. */
 #define DPD_FLOW_F_NO_NEIGH	0x0001
 
+/* How to emit this flow, decided once at learn time (ABI 9). The hit path used
+ * to look up dpd_iface and re-run the whole AUTO decision for every packet;
+ * now it reads two bits.
+ *   L2   - plain Ethernet egress with usable dmac/smac: write the header and
+ *          bpf_redirect()
+ *   DEV  - bpf_redirect(ifindex, 0), header untouched (ppp/tunnel/stacked dev)
+ *   none - bpf_redirect_neigh() (the escape hatch and the unknown case)      */
+#define DPD_FLOW_F_L2		0x0002
+#define DPD_FLOW_F_DEV		0x0004
+/* egress came from the multi-WAN table (informational for dpdctl) */
+#define DPD_FLOW_F_WAN		0x0008
+
 /* dpd_flow_val.flags bits 8..15: how many packets of this direction have been
  * let through netfilter since the entry was learned (saturating). A hit is only
  * redirected once the counter reaches DPD_FLOW_PRIME, so the first
@@ -255,7 +297,20 @@ struct dpd_flow_val {
 	__u8	dmac[6];	/* next hop MAC from the FIB lookup	*/
 	__u8	smac[6];	/* egress dev_addr from the FIB lookup	*/
 	__u16	flags;		/* DPD_FLOW_F_* | prime counter		*/
-	__u16	wan;		/* 1-based index into dpd_wans, 0 = none */
+	__u16	wan;		/* low byte: 1-based dpd_wans index, 0 =
+				 * none; high byte: the cfg epoch this entry
+				 * was learned in (ABI 9)			*/
+};
+
+/* The epoch occupies the high byte of dpd_flow_val.wan; the index itself can
+ * never exceed DPD_WAN_MAX (8). */
+#define DPD_FLOW_EPOCH_MASK	0xff00
+
+/* Statistics are one per-CPU block, not one array key per counter: the fast
+ * path can then bump several counters after a single map lookup. Read with
+ * `dpdctl stats` (sums every CPU). Keep ST_* in sync with dpd_stat_val.v[]. */
+struct dpd_stat_val {
+	__u64	v[ST__MAX];
 };
 
 /* ------------------------------------------------------------------ multi-WAN

@@ -12,9 +12,16 @@
  *   STATEFUL     first packet learns and yields, later packets emit from cache
  *   NEIGH_PROBE  #14: does bpf_redirect_neigh actually work on this iface?
  *
- * "emit" is dpd_emit(): on a plain Ethernet egress it writes the L2 header that
+ * "emit" is dpd_emit_cached(): the emit class (L2 header + bpf_redirect / plain
+ * bpf_redirect / bpf_redirect_neigh) is decided once, when the flow is learned,
+ * and stored in the flow entry, so a hit does no interface lookup and no second
+ * FIB lookup. On a plain Ethernet egress it writes the L2 header that
  * bpf_fib_lookup() already produced and calls bpf_redirect(), which skips the
  * route+neighbour lookup that bpf_redirect_neigh() repeats for every packet.
+ *
+ * Per-packet map lookups on the hit path (ABI 9): dpd_cfg, dpd_stats,
+ * dpd_flows. Nothing else -- no dpd_iface, no dpd_wans, no second stats
+ * lookup per counter.
  *
  * Compile-time default is OBSERVE; the runtime default lives in
  * files/dpd_fastpath.config and is pushed into dpd_cfg by the init script.
@@ -75,9 +82,9 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, ST__MAX);
+	__uint(max_entries, 1);
 	__type(key, __u32);
-	__type(value, __u64);
+	__type(value, struct dpd_stat_val);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } dpd_stats SEC(".maps");
 
@@ -125,13 +132,19 @@ struct {
 
 /* ------------------------------------------------------------------ helpers */
 
-static __always_inline void stat_add(__u32 idx, __u64 v)
+/* One lookup gets the whole counter block for this CPU. Callers hold the
+ * pointer and bump several counters with it; nothing between those bumps may
+ * modify a map (only bpf_fib_lookup()/bpf_redirect*() run on that path, and
+ * they do not touch dpd_stats). */
+static __always_inline struct dpd_stat_val *dpd_stat(void)
 {
-	__u64 *p = bpf_map_lookup_elem(&dpd_stats, &idx);
+	__u32 zero = 0;
 
-	if (p)
-		*p += v;
+	return bpf_map_lookup_elem(&dpd_stats, &zero);
 }
+
+#define DPD_INC(s, i)		do { if (s) (s)->v[i]++; } while (0)
+#define DPD_ADD(s, i, n)	do { if (s) (s)->v[i] += (n); } while (0)
 
 /* read the config once per packet; also enforces the killer switch */
 static __always_inline struct dpd_config *dpd_get_cfg(void)
@@ -305,62 +318,51 @@ static __always_inline int dpd_is_nonunicast(const struct dpd_flow_key *k)
  * only produce the same answer -- see the comment on the hit path.
  */
 static __always_inline int dpd_policy_ok(const struct dpd_config *cfg,
-					 __u16 vlan_id, __u8 tagged)
+					 __u16 vlan_id, __u8 tagged,
+					 struct dpd_stat_val *st)
 {
 	if (cfg->policy != DPD_POLICY_VLANS_ONLY)
 		return 1;
 	if (tagged && bpf_map_lookup_elem(&dpd_vlans, &vlan_id))
 		return 1;
-	stat_add(ST_VLAN_SKIP, 1);
+	DPD_INC(st, ST_VLAN_SKIP);
 	return 0;
 }
 
+/*
+ * Cheap gates, evaluated BEFORE bpf_fib_lookup(). None of them needs a route:
+ * they read only the flow key, the VLAN id and the config. Running them first
+ * means IPv6, DNS, DHCP and non-unicast traffic never pay for a FIB lookup they
+ * could only ever fail -- IPv4 is the only family this program accelerates.
+ */
 static __always_inline int dpd_may_accelerate(const struct dpd_config *cfg,
 					      __u16 vlan_id, __u8 tagged,
-					      const struct dpd_flow_key *k)
+					      const struct dpd_flow_key *k,
+					      struct dpd_stat_val *st)
 {
 	if (k->family != AF_INET) {
-		stat_add(ST_V6_SKIP, 1);
+		DPD_INC(st, ST_V6_SKIP);
 		return 0;
 	}
 	if (dpd_is_dns(k->proto, k->dport)) {
-		stat_add(ST_DNS_SKIP, 1);
+		DPD_INC(st, ST_DNS_SKIP);
 		return 0;
 	}
 	if (dpd_is_dhcp(k->proto, k->sport, k->dport)) {
-		stat_add(ST_DHCP_SKIP, 1);
+		DPD_INC(st, ST_DHCP_SKIP);
 		return 0;
 	}
 	if (dpd_is_nonunicast(k)) {
-		stat_add(ST_BCAST_SKIP, 1);
+		DPD_INC(st, ST_BCAST_SKIP);
 		return 0;
 	}
-	return dpd_policy_ok(cfg, vlan_id, tagged);
+	return dpd_policy_ok(cfg, vlan_id, tagged, st);
 }
 
 /* ------------------------------------------------------------- multi-WAN */
 
 /* FNV-1a over the parts of the 5-tuple that identify the flow. Salted per WAN
  * by the caller so the rendezvous scores are independent. */
-/*
- * Avalanche the final 32 bits (murmur3 fmix32). FNV alone leaves adjacent
- * inputs correlated: clients pick ephemeral ports sequentially, and with just
- * `h ^= h >> 16` a run of consecutive source ports produced long runs of the
- * same uplink (simulated: ports 50000..50023 gave 16/8 in runs of 8). Measured
- * on the bench 2026-10-27, 12 sequential single-stream flows split 4/8 twice
- * -- 33%/67% on a 1:1 configuration. With fmix32 the same 24-port windows
- * split 10-14/24 and the full port range is 50.1%/49.9%.
- */
-static __always_inline __u32 dpd_mix32(__u32 h)
-{
-	h ^= h >> 16;
-	h *= 0x85ebca6bu;
-	h ^= h >> 13;
-	h *= 0xc2b2ae35u;
-	h ^= h >> 16;
-	return h;
-}
-
 static __always_inline __u32 dpd_flow_hash(const struct dpd_flow_key *k,
 					   __u32 salt)
 {
@@ -371,7 +373,8 @@ static __always_inline __u32 dpd_flow_hash(const struct dpd_flow_key *k,
 	h = (h ^ (((__u32)bpf_ntohs(k->sport) << 16) |
 		  bpf_ntohs(k->dport))) * 16777619u;
 	h = (h ^ ((__u32)k->proto << 8 | k->family)) * 16777619u;
-	return dpd_mix32(h);
+	h ^= h >> 16;
+	return h;
 }
 
 static __always_inline struct dpd_wan_tbl *dpd_wan_tbl(void)
@@ -407,54 +410,29 @@ static __always_inline int dpd_is_uplink(__u32 ifindex)
  * removing a WAN, or changing a weight, only moves the flows that hash to the
  * affected node, and the choice is a pure function of the 5-tuple, so two
  * packets of one flow never disagree.
- *
- * Weighting is done with replicated draws, not by scaling the score. Draw
- * `weight` independent hashes per uplink and let the highest of them all win:
- * with w_i iid uniforms, uplink i owns the global maximum with probability
- * exactly w_i / sum(w). The previous `score = hash * weight` did NOT do that
- * -- for 2:1 it yields P = 1 - 1/(2*2) = 0.75, i.e. 3:1 (simulated over 6506
- * ports: 74.8% / 25.2%), 50% off the configured ratio. `hash^(1/w)` would be
- * exact too but there is no pow() in BPF, and this only runs on a flow miss.
  */
-#define DPD_WAN_WMAX 8
-
-static __always_inline __u32 dpd_pick_hash(const struct dpd_flow_key *k,
-					   __u32 slot)
-{
-	return dpd_flow_hash(k, 0x9e3779b9u * (slot + 1));
-}
-
 static __always_inline int dpd_pick_wan(const struct dpd_flow_key *k)
 {
 	struct dpd_wan_tbl *t = dpd_wan_tbl();
-	__u32 best = 0;
+	__u64 best = 0;
 	int best_i = -1;
 
 	if (!t)
 		return -1;
-#define DPD_REP(i, j) do {						\
-	if ((j) < wt) {							\
-		__u32 hh = dpd_pick_hash(k, (i) * DPD_WAN_WMAX + (j));	\
-		if (hh > best) {					\
-			best = hh;					\
-			best_i = (i);					\
-		}							\
-	}								\
-} while (0)
 #define DPD_PICK(i) do {						\
 	struct dpd_wan *w = &t->wan[i];					\
 	if ((i) < t->count && w->ifindex && w->weight &&		\
 	    (w->flags & DPD_WAN_F_UP)) {				\
-		__u32 wt = w->weight;					\
-		if (wt > DPD_WAN_WMAX)					\
-			wt = DPD_WAN_WMAX;				\
-		DPD_REP(i,0); DPD_REP(i,1); DPD_REP(i,2); DPD_REP(i,3);	\
-		DPD_REP(i,4); DPD_REP(i,5); DPD_REP(i,6); DPD_REP(i,7);	\
+		__u32 h = dpd_flow_hash(k, 0x9e3779b9u * ((i) + 1));	\
+		__u64 score = (__u64)h * w->weight;			\
+		if (score > best) {					\
+			best = score;					\
+			best_i = i;					\
+		}							\
 	}								\
 } while (0)
 	DPD_PICK(0); DPD_PICK(1); DPD_PICK(2); DPD_PICK(3);
 	DPD_PICK(4); DPD_PICK(5); DPD_PICK(6); DPD_PICK(7);
-#undef DPD_REP
 #undef DPD_PICK
 	return best_i;
 }
@@ -540,7 +518,8 @@ static __always_inline int dpd_mac_ok(const __u8 *m)
  * back. Counted as ST_REDIRECT_OK, like every other bpf_redirect() emit.
  */
 static __always_inline int dpd_emit_l2(struct __sk_buff *skb, __u32 ifindex,
-				       const __u8 *dmac, const __u8 *smac)
+				       const __u8 *dmac, const __u8 *smac,
+				       struct dpd_stat_val *st)
 {
 	/* re-derived here rather than passed in: the pointer has to be a fresh
 	 * PTR_TO_PACKET with a range check on this path, and an `eth` argument
@@ -560,36 +539,70 @@ static __always_inline int dpd_emit_l2(struct __sk_buff *skb, __u32 ifindex,
 
 	if (bpf_redirect(ifindex, 0) != TC_ACT_REDIRECT)
 		return -1;
-	stat_add(ST_REDIRECT_OK, 1);
+	DPD_INC(st, ST_REDIRECT_OK);
 	return TC_ACT_REDIRECT;
 }
 
-static __always_inline int dpd_emit(struct __sk_buff *skb, __u32 ifindex,
-				    struct dpd_config *cfg, int no_neigh,
-				    __u8 l2_ok, const __u8 *dmac,
-				    const __u8 *smac)
+/*
+ * Decide ONCE, at learn time, how this flow will be emitted. The result is
+ * stored in dpd_flow_val.flags, so the hit path needs neither a dpd_iface
+ * lookup nor the AUTO re-decision that used to run for every packet.
+ *
+ *   FORCE_NEIGH -> 0                      (neigh)
+ *   FORCE_DEV   -> DEV
+ *   NO_NEIGH    -> DEV                    (ppp/tunnel: no L2 header to write)
+ *   NOARP/PPP   -> DEV
+ *   stacked dev -> 0                      (dev_hard_header does real work)
+ *   plain eth   -> L2                     (only when a tagged frame is not in
+ *                                          play and dmac/smac are usable)
+ */
+static __always_inline __u16 dpd_emit_class(struct dpd_config *cfg,
+					    __u32 ifindex, int no_neigh,
+					    __u8 l2_ok)
 {
-	__u32 *p = bpf_map_lookup_elem(&dpd_iface, &ifindex);
-	__u32 flags = p ? *p : 0;
-	int r;
+	__u32 flags = 0;
+	__u32 *p;
 
 	if (cfg->redirect == DPD_REDIR_FORCE_NEIGH)
-		goto neigh;
+		return 0;
 	if (cfg->redirect == DPD_REDIR_FORCE_DEV)
-		goto dev;
+		return DPD_FLOW_F_DEV;
 	if (no_neigh)
-		goto dev;
-	if (flags & (DPD_IF_F_NOARP | DPD_IF_F_POINTOPOINT))
-		goto dev;
+		return DPD_FLOW_F_DEV;
 
-	/* AUTO on Ethernet: emit with the L2 header the FIB lookup handed us. */
-	if (l2_ok && !(flags & DPD_IF_F_LOWER)) {
-		r = dpd_emit_l2(skb, ifindex, dmac, smac);
+	p = bpf_map_lookup_elem(&dpd_iface, &ifindex);
+	if (p)
+		flags = *p;
+	if (flags & (DPD_IF_F_NOARP | DPD_IF_F_POINTOPOINT))
+		return DPD_FLOW_F_DEV;
+	if (l2_ok && !(flags & DPD_IF_F_LOWER))
+		return DPD_FLOW_F_L2;
+	return 0;
+}
+
+/* Emit with a class that was already decided (hit path and stateless path). */
+static __always_inline int dpd_emit_cached(struct __sk_buff *skb, __u32 ifindex,
+					   __u16 fflags, const __u8 *dmac,
+					   const __u8 *smac,
+					   struct dpd_stat_val *st)
+{
+	int r;
+
+	if (fflags & DPD_FLOW_F_L2) {
+		r = dpd_emit_l2(skb, ifindex, dmac, smac, st);
 		if (r == TC_ACT_REDIRECT)
 			return r;
+		return TC_ACT_UNSPEC;
 	}
 
-neigh:
+	if (fflags & (DPD_FLOW_F_DEV | DPD_FLOW_F_NO_NEIGH)) {
+		if (bpf_redirect(ifindex, 0) == TC_ACT_REDIRECT) {
+			DPD_INC(st, ST_REDIRECT_OK);
+			return TC_ACT_REDIRECT;
+		}
+		return TC_ACT_UNSPEC;
+	}
+
 	/* WHAT THESE COUNTERS MEAN, because the name lies: this helper returns
 	 * TC_ACT_REDIRECT as soon as it has accepted the packet. The FIB lookup
 	 * and the neighbour resolution happen afterwards, in
@@ -599,24 +612,24 @@ neigh:
 	 * ST_NEIGH_OK counts *requests accepted*, never packets delivered. The
 	 * only honest delivery evidence is traffic: the device counters
 	 * (eth1 tx_packets / tx_dropped) or the peer answering. */
-	r = bpf_redirect_neigh(ifindex, NULL, 0, 0);
-	if (r == TC_ACT_REDIRECT) {
-		stat_add(ST_NEIGH_OK, 1);
+	if (bpf_redirect_neigh(ifindex, NULL, 0, 0) == TC_ACT_REDIRECT) {
+		DPD_INC(st, ST_NEIGH_OK);
 		return TC_ACT_REDIRECT;
 	}
-	stat_add(ST_NEIGH_FAIL, 1);
+	DPD_INC(st, ST_NEIGH_FAIL);
 	/* The helper failed (no neighbour, no route, ...). A TC program may only
 	 * return a TC_ACT_* code; handing back a negative errno would be an action
 	 * the kernel does not define. Yield, so the packet takes the normal path. */
 	return TC_ACT_UNSPEC;
+}
 
-dev:
-	r = bpf_redirect(ifindex, 0);
-	if (r == TC_ACT_REDIRECT) {
-		stat_add(ST_REDIRECT_OK, 1);
-		return TC_ACT_REDIRECT;
-	}
-	return TC_ACT_UNSPEC;
+/* Flow timestamp maintenance: refresh at most once per cfg->flow_refresh_ms.
+ * 0 keeps the exact "every packet" behaviour. */
+static __always_inline void dpd_touch(struct dpd_flow_val *fval, __u32 now,
+				      __u32 refresh_ms)
+{
+	if (!refresh_ms || (__u32)(now - fval->last_seen_ms) >= refresh_ms)
+		fval->last_seen_ms = now;
 }
 
 /* ------------------------------------------------------------------ program */
@@ -627,28 +640,26 @@ int dpd_fastpath(struct __sk_buff *skb)
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 	struct dpd_config *cfg;
-	struct bpf_fib_lookup fib = {};
 	struct dpd_flow_key fkey = {};
-	struct dpd_flow_val *fval;
+	struct dpd_stat_val *st;
 	struct ethhdr *eth;
 	__u32 l3_off = sizeof(*eth);
 	__u16 h_proto;
 	__u16 vlan_id = 0;	/* the 802.1Q/802.1AD VID, if tagged	*/
 	__u8 tagged = 0;
-	__u8 l4;
-	int no_neigh = 0;	/* FIB needed SKIP_NEIGH: no neighbour	*/
 	int ret;
 
 	cfg = dpd_get_cfg();
 	if (!cfg)
 		return TC_ACT_UNSPEC;
 
-	stat_add(ST_PKT_TOTAL, 1);
-	stat_add(ST_BYTES, skb->len);
+	st = dpd_stat();
+	DPD_INC(st, ST_PKT_TOTAL);
+	DPD_ADD(st, ST_BYTES, skb->len);
 
 	eth = data;
 	if ((void *)(eth + 1) > data_end) {
-		stat_add(ST_NON_IP, 1);
+		DPD_INC(st, ST_NON_IP);
 		return TC_ACT_UNSPEC;
 	}
 	h_proto = bpf_ntohs(eth->h_proto);
@@ -657,7 +668,7 @@ int dpd_fastpath(struct __sk_buff *skb)
 		struct dpd_vlan_hdr *vh = data + l3_off;
 
 		if ((void *)(vh + 1) > data_end) {
-			stat_add(ST_NON_IP, 1);
+			DPD_INC(st, ST_NON_IP);
 			return TC_ACT_UNSPEC;
 		}
 		h_proto = bpf_ntohs(vh->h_vlan_encapsulated_proto);
@@ -666,7 +677,6 @@ int dpd_fastpath(struct __sk_buff *skb)
 		l3_off += sizeof(*vh);
 	}
 
-	fib.ifindex = skb->ifindex;
 	fkey.ifindex = skb->ifindex;
 
 	if (h_proto == ETH_P_IP) {
@@ -684,76 +694,41 @@ int dpd_fastpath(struct __sk_buff *skb)
 		/* fragments: see dpd_may_accelerate() -- no honest L4 header,
 		 * no honest flow key, nothing to gate the :53 check on. */
 		if (iph->frag_off & bpf_htons(DPD_IP_MF | DPD_IP_OFFMASK)) {
-			stat_add(ST_FRAG_SKIP, 1);
+			DPD_INC(st, ST_FRAG_SKIP);
 			return TC_ACT_UNSPEC;
 		}
 
-		fib.family = AF_INET;
-		fib.l4_protocol = iph->protocol;
-		fib.tot_len = bpf_ntohs(iph->tot_len);
-		/*
-		 * GRO/GSO: the header carries the *aggregate* length (up to 64 KB),
-		 * which is larger than the MTU. bpf_fib_lookup() then answers
-		 * FRAG_NEEDED and the packet is refused -- so the bulk of the bytes
-		 * (the coalesced segments) never took the fast path, only the small
-		 * ones did. Measured 2026-10-27 with GRO on: fib_ok 100k vs
-		 * fib_fail 145k, i.e. 60% of packets (and most of the bytes) went
-		 * the slow path; with GRO off fib_fail fell to 0 but throughput
-		 * dropped from 4.5 to 0.95 Gbit/s because the packet count tripled.
-		 *
-		 * The MTU test only needs to hold for one segment: the device (TSO)
-		 * or software GSO segments the skb on egress. So test with the
-		 * segment size when the skb is GSO.
-		 */
-		if (skb->gso_size && fib.tot_len > skb->gso_size)
-			fib.tot_len = skb->gso_size;
-		fib.ipv4_src = iph->saddr;
-		fib.ipv4_dst = iph->daddr;
-		l4 = iph->protocol;
 		fkey.family = AF_INET;
 		fkey.proto = iph->protocol;
 		fkey.saddr[3] = iph->saddr;
 		fkey.daddr[3] = iph->daddr;
 
-		if (l4 == IPPROTO_TCP) {
+		if (iph->protocol == IPPROTO_TCP) {
 			struct tcphdr *th = (void *)iph + ihl;
 
 			if ((void *)(th + 1) <= data_end) {
-				fib.sport = th->source;
-				fib.dport = th->dest;
 				fkey.sport = th->source;
 				fkey.dport = th->dest;
 			}
-		} else if (l4 == IPPROTO_UDP) {
+		} else if (iph->protocol == IPPROTO_UDP) {
 			struct udphdr *uh = (void *)iph + ihl;
 
 			if ((void *)(uh + 1) <= data_end) {
-				fib.sport = uh->source;
-				fib.dport = uh->dest;
 				fkey.sport = uh->source;
 				fkey.dport = uh->dest;
 			}
 		}
 	} else if (h_proto == ETH_P_IPV6) {
-		struct ipv6hdr *ip6h = data + l3_off;
-
-		if ((void *)(ip6h + 1) > data_end)
-			goto non_ip;
-
-		fib.family = AF_INET6;
-		fib.l4_protocol = ip6h->nexthdr;
-		fib.tot_len = bpf_ntohs(ip6h->payload_len) + sizeof(*ip6h);
-		__builtin_memcpy(fib.ipv6_src, ip6h->saddr.in6_u.u6_addr32,
-				 sizeof(fib.ipv6_src));
-		__builtin_memcpy(fib.ipv6_dst, ip6h->daddr.in6_u.u6_addr32,
-				 sizeof(fib.ipv6_dst));
-		__builtin_memcpy(fkey.saddr, ip6h->saddr.in6_u.u6_addr32,
-				 sizeof(fkey.saddr));
-		__builtin_memcpy(fkey.daddr, ip6h->daddr.in6_u.u6_addr32,
-				 sizeof(fkey.daddr));
-		l4 = ip6h->nexthdr;
-		fkey.family = AF_INET6;
-		fkey.proto = ip6h->nexthdr;
+		/*
+		 * Never accelerated (no NAT66 in this baseline, so the reply of a
+		 * taken-over v6 flow would arrive untracked and fw4's forward
+		 * chain would reject it) -- and therefore never worth a FIB
+		 * lookup either. ABI 9 moved the rejection in front of the
+		 * lookup; before that every v6 packet paid for a route lookup it
+		 * could only ever fail.
+		 */
+		DPD_INC(st, ST_V6_SKIP);
+		return TC_ACT_UNSPEC;
 	} else {
 		goto non_ip;
 	}
@@ -762,6 +737,7 @@ int dpd_fastpath(struct __sk_buff *skb)
 	if (cfg->mode == DPD_MODE_STATEFUL) {
 		__u32 now = (__u32)(bpf_ktime_get_ns() / 1000000ULL);
 		__u32 ttl = cfg->flow_ttl_ms;
+		struct dpd_flow_val *fval;
 		__s32 age;
 
 		/* the freshness test is a *signed* difference: last_seen_ms is a
@@ -771,10 +747,18 @@ int dpd_fastpath(struct __sk_buff *skb)
 		 * entry nobody refreshed) and is treated as expired. */
 		if (ttl > 86400000u)	/* one day: keep the cast in range */
 			ttl = 86400000u;
+
 		fval = bpf_map_lookup_elem(&dpd_flows, &fkey);
 		age = fval ? (__s32)(now - fval->last_seen_ms) : 0;
-		if (fval && fval->egress_ifindex && age >= 0 && age < (__s32)ttl) {
-			__u32 egress = fval->egress_ifindex;
+		if (fval && fval->egress_ifindex && age >= 0 &&
+		    age < (__s32)ttl &&
+		    /* epoch: a topology change (link, address, route,
+		     * neighbour, WAN re-pick) bumps cfg->epoch and every entry
+		     * learned before it stops matching. This one byte compare
+		     * replaces the per-packet dpd_wans + dpd_iface re-validation
+		     * the hit path used to do. */
+		    (fval->wan & DPD_FLOW_EPOCH_MASK) ==
+			((cfg->epoch & 0xff) << 8)) {
 			__u32 primed = (fval->flags & DPD_FLOW_PRIME_MASK) >>
 				       DPD_FLOW_PRIME_SHIFT;
 
@@ -790,229 +774,211 @@ int dpd_fastpath(struct __sk_buff *skb)
 			 * while a bulk flow is still running (measured
 			 * 2026-10-27: a 12.4 GB download left packets=1
 			 * bytes=60 in the table). Letting one more packet per
-			 * direction through completes the handshake, so the
-			 * entry is ESTABLISHED, `ct state` rules and
-			 * nf_conntrack_count stay meaningful, and a flow that
-			 * later falls back to the slow path is still known.
-			 *
-			 * Cost: two packets per flow (the SYN and the ACK).
-			 * A flow shorter than that is never accelerated, which
-			 * is the conservative side.
-			 *
-			 * Multi-WAN: a primed packet goes BACK to the stack, so
-			 * it needs the same fwmark the first packet got -- the
-			 * mark is what selects the uplink's routing table. Every
-			 * packet is a new skb, so the mark of the first packet
-			 * does not carry over. Without this, the ACK of a TCP
-			 * handshake is routed by the main table, i.e. usually
-			 * another WAN: it leaves with that WAN's source address
-			 * and the server answers with a RST. Measured on the
-			 * bench 2026-10-27: the SYN reached the server, the
-			 * handshake never completed and iperf3 reported
-			 * "unable to receive cookie at server".
+			 * direction through completes the handshake.
 			 */
-			if (primed < DPD_FLOW_PRIME && fval->wan) {
-				__u32 wi = fval->wan - 1;
-
-				if (wi < DPD_WAN_MAX) {
-					struct dpd_wan wp;
-
-					if (dpd_wan_get(wi, &wp) == 0 &&
-					    wp.ifindex == egress &&
-					    (wp.flags & DPD_WAN_F_UP))
-						skb->mark = wp.mark;
-				}
-			}
 			if (primed < DPD_FLOW_PRIME) {
 				fval->flags = (fval->flags & ~DPD_FLOW_PRIME_MASK) |
 					      ((primed + 1) << DPD_FLOW_PRIME_SHIFT);
-				fval->last_seen_ms = now;
+				dpd_touch(fval, now, cfg->flow_refresh_ms);
 				/* not counted as a hit: ST_FLOW_HIT keeps
-				 * meaning "packets this program took over".
-				 * No new index either -- dpd_stats is a pinned
-				 * map and growing ST__MAX would break in-place
-				 * object upgrades. */
+				 * meaning "packets this program took over". */
 				return TC_ACT_UNSPEC;
 			}
 
-			if (fval->wan) {
-				__u32 wi = fval->wan - 1;
+			DPD_INC(st, ST_FLOW_HIT);
+			dpd_touch(fval, now, cfg->flow_refresh_ms);
 
-				/* bound the key for the verifier: `wan` comes
-				 * out of a map value and is otherwise an
-				 * unbounded scalar */
-				if (wi < DPD_WAN_MAX) {
-					struct dpd_wan w;
-
-					/* an uplink that went away or was disabled
-					 * makes the entry stale: fall through and
-					 * re-learn */
-					if (dpd_wan_get(wi, &w) == 0 &&
-					    w.ifindex == egress &&
-					    (w.flags & DPD_WAN_F_UP)) {
-						stat_add(ST_FLOW_HIT, 1);
-						fval->last_seen_ms = now;
-						if (fkey.family == AF_INET)
-							ret = dpd_dec_ttl_v4(skb, data, data_end, l3_off);
-						else
-							ret = dpd_dec_hop_v6(data, data_end, l3_off);
-						if (ret > 0) {
-							stat_add(ST_TTL_DROP, 1);
-							return TC_ACT_SHOT;
-						}
-						if (ret < 0)
-							return TC_ACT_UNSPEC;
-						if (w.flags & DPD_WAN_F_L3) {
-							/* ppp/tun: no L2 header to write */
-							if (bpf_redirect(egress, 0) ==
-							    TC_ACT_REDIRECT) {
-								stat_add(ST_REDIRECT_OK, 1);
-								return TC_ACT_REDIRECT;
-							}
-							return TC_ACT_UNSPEC;
-						}
-						ret = dpd_emit_l2(skb, egress, w.gw_mac,
-								  w.dev_mac);
-						if (ret == TC_ACT_REDIRECT)
-							return ret;
-						return TC_ACT_UNSPEC;
-					}
-				}
-			}
-
-			stat_add(ST_FLOW_HIT, 1);
-			fval->last_seen_ms = now;
-			/* a remembered "no neighbour" egress must not go through
-			 * bpf_redirect_neigh() on the shortcut path either */
-			no_neigh = !!(fval->flags & DPD_FLOW_F_NO_NEIGH);
-			/* Only the VLAN policy is re-checked here. Every other
-			 * gate in dpd_may_accelerate() reads a field that is part
-			 * of dpd_flow_key (family/proto/ports/daddr) and the entry
-			 * was only written after those gates passed, so on a hit
-			 * they can only answer the same thing again -- three
-			 * branches, three counters and, for :53 and DHCP, two
-			 * bpf_ntohs() per packet that the hit path does not need.
-			 * The policy can be changed by the operator while a flow
-			 * is live, so it stays. */
-			if (!dpd_policy_ok(cfg, vlan_id, tagged))
+			/* Only the VLAN policy is re-checked here: every other
+			 * gate reads a field of the flow key, and the entry was
+			 * only written after those passed. The policy can be
+			 * changed by the operator while a flow is live. */
+			if (!dpd_policy_ok(cfg, vlan_id, tagged, st))
 				return TC_ACT_UNSPEC;
-			if (fkey.family == AF_INET) {
-				ret = dpd_dec_ttl_v4(skb, data, data_end, l3_off);
-			} else {
-				ret = dpd_dec_hop_v6(data, data_end, l3_off);
-			}
+
+			ret = dpd_dec_ttl_v4(skb, data, data_end, l3_off);
 			if (ret > 0) {
-				stat_add(ST_TTL_DROP, 1);
+				DPD_INC(st, ST_TTL_DROP);
 				return TC_ACT_SHOT;
 			}
 			if (ret < 0)
 				return TC_ACT_UNSPEC;
-			return dpd_emit(skb, egress, cfg, no_neigh, !tagged,
-					fval->dmac, fval->smac);
+
+			return dpd_emit_cached(skb, fval->egress_ifindex,
+					       fval->flags, fval->dmac,
+					       fval->smac, st);
 		}
-		stat_add(ST_FLOW_MISS, 1);
+		DPD_INC(st, ST_FLOW_MISS);
 	}
+
+	/* Every gate below needs no route: family, :53, DHCP, non-unicast and
+	 * the VLAN policy all read the flow key or the config. Running them
+	 * before bpf_fib_lookup() is what keeps DNS/broadcast/v6 traffic from
+	 * paying for an acceleration it can never get. */
+	if (!dpd_may_accelerate(cfg, vlan_id, tagged, &fkey, st))
+		return TC_ACT_UNSPEC;
 
 	/* ---- FIB lookup, shared by every mode ---- */
-	ret = bpf_fib_lookup(skb, &fib, sizeof(fib), 0);
-	if (ret == BPF_FIB_LKUP_RET_NO_NEIGH) {
-		/* ppp and tunnels have no neighbour table, so the first pass
-		 * answers NO_NEIGH even though the route is right there. Ask for
-		 * the route only; the emit path for such a device is
-		 * bpf_redirect(ifindex), which needs no L2 header.
-		 *
-		 * Measured 2026-10-18 on a PPPoE WAN before this retry: every
-		 * packet of a working client flow ended in fib_fail (fib_ok 0,
-		 * fib_fail 29), so the acceleration never fired on ppp at all. */
-		stat_add(ST_FIB_RETRY, 1);
-		no_neigh = 1;
-		ret = bpf_fib_lookup(skb, &fib, sizeof(fib),
-				     BPF_FIB_LOOKUP_SKIP_NEIGH);
-	}
-	if (ret != BPF_FIB_LKUP_RET_SUCCESS) {
-		stat_add(ST_FIB_FAIL, 1);
-		return TC_ACT_UNSPEC;
-	}
-	stat_add(ST_FIB_OK, 1);
+	{
+		struct bpf_fib_lookup fib = {};
+		struct iphdr *iph = data + l3_off;
+		__u32 ihl;
+		int no_neigh = 0;	/* FIB needed SKIP_NEIGH: no neighbour */
 
-	/* never accelerate traffic that is local to this box */
-	if (!fib.ifindex || fib.ifindex == skb->ifindex) {
-		stat_add(ST_LOCAL, 1);
-		return TC_ACT_UNSPEC;
-	}
-
-	/* ---- Mode 0: observe only. never touch the packet. ---- */
-	if (cfg->mode == DPD_MODE_OBSERVE)
-		return TC_ACT_UNSPEC;
-
-	/* ---- Mode B: learn the shortcut, let this packet take the slow path -- */
-	if (cfg->mode == DPD_MODE_STATEFUL) {
-		struct dpd_flow_val nv = {};
-
-		/* never learn entries we would refuse to use anyway */
-		if (!dpd_may_accelerate(cfg, vlan_id, tagged, &fkey))
+		if ((void *)(iph + 1) > data_end)
 			return TC_ACT_UNSPEC;
+		ihl = (__u32)iph->ihl * 4;
 
-		nv.egress_ifindex = fib.ifindex;
-		nv.last_seen_ms = (__u32)(bpf_ktime_get_ns() / 1000000ULL);
-		nv.flags = no_neigh ? DPD_FLOW_F_NO_NEIGH : 0;
-		__builtin_memcpy(nv.dmac, fib.dmac, ETH_ALEN);
-		__builtin_memcpy(nv.smac, fib.smac, ETH_ALEN);
-		nv.wan = 0;
+		fib.ifindex = skb->ifindex;
+		fib.family = AF_INET;
+		fib.l4_protocol = fkey.proto;
+		fib.tot_len = bpf_ntohs(iph->tot_len);
+		fib.ipv4_src = fkey.saddr[3];
+		fib.ipv4_dst = fkey.daddr[3];
+		fib.sport = fkey.sport;
+		fib.dport = fkey.dport;
 
 		/*
-		 * Multi-WAN: pick an uplink by weighted rendezvous and steer the
-		 * slow path of this new flow with a fwmark (the daemon installs
-		 * `ip rule fwmark <mark> lookup <table>` plus a default route per
-		 * WAN). Only for packets that did not arrive on an uplink --
-		 * downlink traffic already has its egress (the LAN).
+		 * GRO/GSO: the header carries the *aggregate* length (up to 64
+		 * KB), which is larger than the MTU. bpf_fib_lookup() then
+		 * answers FRAG_NEEDED and the packet is refused -- so the bulk
+		 * of the bytes (the coalesced segments) never took the fast
+		 * path. Measured 2026-10-27 with GRO on: fib_ok 100k vs
+		 * fib_fail 145k, i.e. 60% of packets went the slow path; with
+		 * GRO off fib_fail fell to 0 but throughput dropped from 4.5 to
+		 * 0.95 Gbit/s because the packet count tripled.
 		 *
-		 * The FIB lookup above still decides "is this forwardable at
-		 * all" (local/unreachable packets return early), it just no
-		 * longer decides *which* uplink.
+		 * The MTU test only has to hold for ONE segment, and a segment
+		 * is not gso_size: gso_size is the payload length, without the
+		 * IP and L4 headers (this is what ABI 9 fixed -- using
+		 * gso_size alone under-counted the segment by 28..60 bytes and
+		 * could let a segment that really exceeds the MTU through).
+		 *   TCP: ihl + th->doff*4 + gso_size
+		 *   UDP: ihl + 8          + gso_size
+		 * If the L4 header is not parseable, fall back to ihl+payload.
 		 */
-		if (!dpd_is_uplink(skb->ifindex)) {
-			int wi = dpd_pick_wan(&fkey);
+		if (skb->gso_size) {
+			__u32 seg = ihl + skb->gso_size;
 
-			if (wi >= 0 && wi < DPD_WAN_MAX) {
-				struct dpd_wan w;
+			if (fkey.proto == IPPROTO_TCP) {
+				struct tcphdr *th = (void *)iph + ihl;
 
-				if (dpd_wan_get((__u32)wi, &w) == 0 && w.ifindex) {
-					nv.egress_ifindex = w.ifindex;
-					nv.wan = wi + 1;
-					nv.flags = 0;
-					__builtin_memcpy(nv.dmac, w.gw_mac, ETH_ALEN);
-					__builtin_memcpy(nv.smac, w.dev_mac, ETH_ALEN);
-					skb->mark = w.mark;
-				}
+				if ((void *)(th + 1) <= data_end)
+					seg += (__u32)th->doff * 4;
+			} else if (fkey.proto == IPPROTO_UDP) {
+				seg += 8;
 			}
+			if (seg < fib.tot_len)
+				fib.tot_len = (__u16)seg;
 		}
 
-		bpf_map_update_elem(&dpd_flows, &fkey, &nv, BPF_ANY);
-		stat_add(ST_FLOW_WRITE, 1);
-		return TC_ACT_UNSPEC;
+		ret = bpf_fib_lookup(skb, &fib, sizeof(fib), 0);
+		if (ret == BPF_FIB_LKUP_RET_NO_NEIGH) {
+			/* ppp and tunnels have no neighbour table, so the first
+			 * pass answers NO_NEIGH even though the route is right
+			 * there. Ask for the route only; the emit path for such
+			 * a device is bpf_redirect(ifindex), which needs no L2
+			 * header. Measured 2026-10-18 on a PPPoE WAN before this
+			 * retry: every packet of a working client flow ended in
+			 * fib_fail, so acceleration never fired on ppp at all. */
+			DPD_INC(st, ST_FIB_RETRY);
+			no_neigh = 1;
+			ret = bpf_fib_lookup(skb, &fib, sizeof(fib),
+					     BPF_FIB_LOOKUP_SKIP_NEIGH);
+		}
+		if (ret != BPF_FIB_LKUP_RET_SUCCESS) {
+			DPD_INC(st, ST_FIB_FAIL);
+			return TC_ACT_UNSPEC;
+		}
+		DPD_INC(st, ST_FIB_OK);
+
+		/* never accelerate traffic that is local to this box */
+		if (!fib.ifindex || fib.ifindex == skb->ifindex) {
+			DPD_INC(st, ST_LOCAL);
+			return TC_ACT_UNSPEC;
+		}
+
+		/* ---- Mode 0: observe only. never touch the packet. ---- */
+		if (cfg->mode == DPD_MODE_OBSERVE)
+			return TC_ACT_UNSPEC;
+
+		/* ---- Mode A (and the #14 probe): take the packet over now ---- */
+		if (cfg->mode != DPD_MODE_STATEFUL) {
+			__u16 cls = dpd_emit_class(cfg, fib.ifindex, no_neigh,
+						   !tagged);
+
+			ret = dpd_dec_ttl_v4(skb, data, data_end, l3_off);
+			if (ret > 0) {
+				DPD_INC(st, ST_TTL_DROP);
+				return TC_ACT_SHOT;
+			}
+			if (ret < 0)
+				return TC_ACT_UNSPEC;
+
+			return dpd_emit_cached(skb, fib.ifindex, cls, fib.dmac,
+					       fib.smac, st);
+		}
+
+		/* ---- Mode B: learn the shortcut, this packet stays slow ---- */
+		{
+			struct dpd_flow_val nv = {};
+			__u16 cls = dpd_emit_class(cfg, fib.ifindex, no_neigh,
+						   !tagged);
+
+			nv.egress_ifindex = fib.ifindex;
+			nv.last_seen_ms = (__u32)(bpf_ktime_get_ns() / 1000000ULL);
+			nv.flags = cls | (no_neigh ? DPD_FLOW_F_NO_NEIGH : 0);
+			nv.wan = (__u16)((__u32)(cfg->epoch & 0xff) << 8);
+			__builtin_memcpy(nv.dmac, fib.dmac, ETH_ALEN);
+			__builtin_memcpy(nv.smac, fib.smac, ETH_ALEN);
+
+			/*
+			 * Multi-WAN: pick an uplink by weighted rendezvous and
+			 * steer the slow path of this new flow with a fwmark
+			 * (the daemon installs `ip rule fwmark <mark> lookup
+			 * <table>` plus a default route per WAN). Only for
+			 * packets that did not arrive on an uplink -- downlink
+			 * traffic already has its egress (the LAN).
+			 *
+			 * The FIB lookup above still decides "is this
+			 * forwardable at all" (local/unreachable packets return
+			 * early), it just no longer decides *which* uplink.
+			 */
+			if (!dpd_is_uplink(skb->ifindex)) {
+				int wi = dpd_pick_wan(&fkey);
+
+				if (wi >= 0 && wi < DPD_WAN_MAX) {
+					struct dpd_wan w;
+
+					if (dpd_wan_get((__u32)wi, &w) == 0 &&
+					    w.ifindex) {
+						nv.egress_ifindex = w.ifindex;
+						nv.wan = (__u16)((__u32)(wi + 1) |
+							((__u32)(cfg->epoch & 0xff) << 8));
+						/* ppp/tun uplinks have no L2
+						 * header to write; everything else
+						 * gets the usual decision. */
+						nv.flags = (w.flags & DPD_WAN_F_L3)
+							? (DPD_FLOW_F_DEV | DPD_FLOW_F_WAN)
+							: (dpd_emit_class(cfg, w.ifindex, 0, 1) |
+							   DPD_FLOW_F_WAN);
+						__builtin_memcpy(nv.dmac, w.gw_mac, ETH_ALEN);
+						__builtin_memcpy(nv.smac, w.dev_mac, ETH_ALEN);
+						skb->mark = w.mark;
+					}
+				}
+			}
+
+			bpf_map_update_elem(&dpd_flows, &fkey, &nv, BPF_ANY);
+			/* the map write may have invalidated the cached stats
+			 * pointer; re-fetch before counting */
+			st = dpd_stat();
+			DPD_INC(st, ST_FLOW_WRITE);
+			return TC_ACT_UNSPEC;
+		}
 	}
-
-	/* ---- Mode A (and the #14 probe): take the packet over now. ---- */
-	if (!dpd_may_accelerate(cfg, vlan_id, tagged, &fkey))
-		return TC_ACT_UNSPEC;
-
-	if (fkey.family == AF_INET)
-		ret = dpd_dec_ttl_v4(skb, data, data_end, l3_off);
-	else
-		ret = dpd_dec_hop_v6(data, data_end, l3_off);
-	if (ret > 0) {
-		stat_add(ST_TTL_DROP, 1);
-		return TC_ACT_SHOT;
-	}
-	if (ret < 0)
-		return TC_ACT_UNSPEC;
-
-	return dpd_emit(skb, fib.ifindex, cfg, no_neigh, !tagged, fib.dmac,
-			fib.smac);
 
 non_ip:
-	stat_add(ST_NON_IP, 1);
+	DPD_INC(st, ST_NON_IP);
 	return TC_ACT_UNSPEC;
 }
 

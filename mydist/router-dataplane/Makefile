@@ -89,6 +89,10 @@ define Build/Compile
 	$(CLANG) $(DPD_BPF_FLAGS) $(DPD_BPF_INCLUDES) \
 		-c $(PKG_BUILD_DIR)/src/dpd_fastpath.bpf.c \
 		-o $(PKG_BUILD_DIR)/dpd_fastpath.bpf.o
+	# ABI stamp: the init script compares it with the ABI of the pinned maps and
+	# drops the pins when an upgrade changed the value layout.
+	grep -oP '^#define DPD_ABI_VERSION\s+\K[0-9]+' \
+		$(PKG_BUILD_DIR)/src/dpd_common.h > $(PKG_BUILD_DIR)/abi
 	@echo "--- dpd_fastpath.bpf.o sections ---"
 	@$(TARGET_CROSS)readelf -S $(PKG_BUILD_DIR)/dpd_fastpath.bpf.o | \
 		grep -E 'BTF|classifier|\.maps' || true
@@ -98,12 +102,14 @@ define Package/dpd-fastpath/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_DIR) $(1)/usr/libexec
 	$(INSTALL_DIR) $(1)/lib/bpf
+	$(INSTALL_DIR) $(1)/usr/lib/dpd
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
 
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/dpdctl $(1)/usr/sbin/dpdctl
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/dpd_fastpath.bpf.o $(1)/lib/bpf/
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/abi $(1)/usr/lib/dpd/abi
 
 	$(INSTALL_BIN) ./files/dpd_fastpath.init $(1)/etc/init.d/dpd-fastpath
 	$(INSTALL_BIN) ./files/mydist-mwan $(1)/usr/libexec/mydist-mwan

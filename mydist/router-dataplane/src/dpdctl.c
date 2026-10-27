@@ -199,6 +199,10 @@ static int cmd_set(int argc, char **argv)
 		}
 	} else if (!strcmp(argv[0], "ttl")) {
 		cfg.flow_ttl_ms = strtoul(argv[1], NULL, 0);
+	} else if (!strcmp(argv[0], "refresh")) {
+		cfg.flow_refresh_ms = strtoul(argv[1], NULL, 0);
+	} else if (!strcmp(argv[0], "epoch")) {
+		cfg.epoch = strtoul(argv[1], NULL, 0) & 0xff;
 	} else if (!strcmp(argv[0], "policy")) {
 		if (policy_parse(argv[1], &cfg.policy)) {
 			fprintf(stderr, "dpdctl: bad policy '%s'\n", argv[1]);
@@ -239,6 +243,9 @@ static int cmd_show(void)
 	printf("redirect     %u\n", cfg.redirect);
 	printf("flow_ttl_ms  %u\n", cfg.flow_ttl_ms);
 	printf("policy       %s (%u)\n", policy_name(cfg.policy), cfg.policy);
+	printf("epoch        %u\n", cfg.epoch);
+	printf("flow_refresh %u ms%s\n", cfg.flow_refresh_ms,
+	       cfg.flow_refresh_ms ? "" : " (every packet)");
 
 	fd = map_open("dpd_vlans");
 	if (fd >= 0) {
@@ -288,7 +295,7 @@ static int cmd_show(void)
 
 static int cmd_stats(void)
 {
-	uint64_t *vals;
+	struct dpd_stat_val *vals;
 	int fd, ncpu;
 
 	fd = map_open("dpd_stats");
@@ -297,24 +304,72 @@ static int cmd_stats(void)
 	ncpu = libbpf_num_possible_cpus();
 	if (ncpu <= 0)
 		ncpu = 1;
-	vals = calloc((size_t)ncpu, sizeof(uint64_t));
+	vals = calloc((size_t)ncpu, sizeof(*vals));
 	if (!vals) {
 		fprintf(stderr, "dpdctl: out of memory\n");
+		return 1;
+	}
+	if (bpf_map_lookup_elem(fd, &(uint32_t){ 0 }, vals)) {
+		fprintf(stderr, "dpdctl: read dpd_stats: %s\n", strerror(errno));
+		free(vals);
 		return 1;
 	}
 
 	printf("  idx  %-13s %s\n", "name", "total");
 	for (uint32_t i = 0; i < ST__MAX; i++) {
-		uint64_t sum = 0;
+		unsigned long long sum = 0;
 
-		if (bpf_map_lookup_elem(fd, &i, vals))
-			continue;
 		for (int c = 0; c < ncpu; c++)
-			sum += vals[c];
-		printf("  %3u  %-13s %llu\n", i, stat_name(i),
-		       (unsigned long long)sum);
+			sum += vals[c].v[i];
+		printf("  %3u  %-13s %llu\n", i, stat_name(i), sum);
 	}
 	free(vals);
+	return 0;
+}
+
+/* Print the ABI version the *loaded object* was built with (0 when no map is
+ * pinned). The init script compares this with the version installed by the
+ * package and drops stale pins when they differ: a map whose value layout
+ * changed cannot be reused in place. */
+static int cmd_abi(void)
+{
+	struct dpd_config cfg = {};
+	int fd = map_open("dpd_cfg");
+
+	if (fd < 0) {
+		printf("0\n");
+		return 0;
+	}
+	if (cfg_read(fd, &cfg)) {
+		printf("0\n");
+		return 0;
+	}
+	printf("%u\n", cfg.abi_version);
+	return 0;
+}
+
+/* Move the flow-cache generation. Every entry remembers the epoch it was
+ * learned in; bumping it makes the whole cache stale in one store, without
+ * walking 16k entries from userspace. Called on link/address/route/neighbour
+ * changes and whenever the multi-WAN table is rewritten. */
+static int cmd_bump(void)
+{
+	struct dpd_config cfg = {};
+	int fd = map_open("dpd_cfg");
+
+	if (fd < 0)
+		return 1;
+	if (cfg_read(fd, &cfg)) {
+		fprintf(stderr, "dpdctl: read dpd_cfg: %s\n", strerror(errno));
+		return 1;
+	}
+	cfg.epoch = (cfg.epoch + 1) & 0xff;
+	cfg.abi_version = DPD_ABI_VERSION;
+	if (cfg_write(fd, &cfg)) {
+		fprintf(stderr, "dpdctl: write dpd_cfg: %s\n", strerror(errno));
+		return 1;
+	}
+	printf("%u\n", cfg.epoch);
 	return 0;
 }
 
@@ -519,7 +574,11 @@ static void usage(const char *argv0)
 		"  set enable <0|1>\n"
 		"  set redirect <auto|neigh|dev>\n"
 		"  set ttl <ms>\n"
+		"  set refresh <ms>        0 = touch the flow timestamp on every packet\n"
 		"  set policy <allow-all|vlans-only>\n"
+		"  bump                    move the flow-cache epoch (drop all cached\n"
+		"                          egress decisions without a map walk)\n"
+		"  abi                     print the ABI of the loaded object (0 = none)\n"
 		"  vlan add <id>|del <id>|list|flush\n"
 		"  stats                   per-reason counters (all cpus summed)\n"
 		"  ifaces <ifname>...      learn IFF_* flags into dpd_iface\n"
@@ -541,6 +600,10 @@ int main(int argc, char **argv)
 		return cmd_vlan(argc - 2, argv + 2);
 	if (!strcmp(argv[1], "stats"))
 		return cmd_stats();
+	if (!strcmp(argv[1], "bump"))
+		return cmd_bump();
+	if (!strcmp(argv[1], "abi"))
+		return cmd_abi();
 	if (!strcmp(argv[1], "ifaces"))
 		return cmd_ifaces(argc - 2, argv + 2);
 	if (!strcmp(argv[1], "flows"))
