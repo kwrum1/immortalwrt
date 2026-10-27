@@ -1,5 +1,5 @@
 {
-	"admin/network/smartdns": {
+	"admin/network/dns": {
 		"title": "DNS",
 		"order": 70,
 		"action": {

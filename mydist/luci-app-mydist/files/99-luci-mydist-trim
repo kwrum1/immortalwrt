@@ -40,6 +40,14 @@ uci -q delete dhcp.@dnsmasq[0].server
 uci -q commit dhcp
 uci -q commit smartdns
 
+# Hide the dnsmasq half of the stock DHCP page: dnsmasq keeps the uci package
+# (it owns /etc/config/dhcp) but has no DNS or DHCP role here. The page guards
+# that section with hasSystemFeature(), which only looks at installed packages.
+DHCP_JS=/www/luci-static/resources/view/network/dhcp.js
+if [ -f "$DHCP_JS" ] && ! grep -q "if(false)" "$DHCP_JS"; then
+	sed -i "s/if(L.hasSystemFeature('dnsmasq'))/if(false)/" "$DHCP_JS"
+fi
+
 /etc/init.d/dnsmasq stop >/dev/null 2>&1
 /etc/init.d/dnsmasq disable >/dev/null 2>&1
 /etc/init.d/smartdns restart >/dev/null 2>&1
