@@ -284,6 +284,72 @@ UDP 没有握手，`nf_conntrack_udp_timeout_stream`（180 秒）在加速流上
 
 ---
 
+### 2.6 ABI 9：每包成本与缓存失效（2026-10-28）
+
+评审（`ebpf-honk-深度优化与风险修补方案`）的 P0/P2 项落在这一版。原则没变：
+**先证明哪些包可以安全加速，再降低这些包的处理成本**；没有为了跑分而放宽任何门禁。
+
+#### 2.6.1 命中路径的 map 查询次数
+
+| 版本 | 每包 map 查询 | 说明 |
+|---|---|---|
+| ABI 8 | `dpd_cfg` + 每计数器各一次 `dpd_stats`（2–5 次）+ `dpd_flows` + 多 WAN 时 `dpd_wans` + `dpd_iface` | 计数器越多越贵；每次都重新判断出口能力 |
+| ABI 9 | `dpd_cfg` + `dpd_stats`（1 次，块结构）+ `dpd_flows` | 出口方式、epoch 都在流表项里 |
+
+* `dpd_stats` 从「每个计数器一个 array key」改成 **每 CPU 一个整块**
+  （`struct dpd_stat_val`），一次查询后连续自增；`dpdctl stats` 负责跨 CPU 求和。
+* 出口方式（`L2` 写头 + `bpf_redirect` / `DEV` 直接 redirect / `neigh`
+  回落）在**学习时判定一次**并写进 `dpd_flow_val.flags`，命中路径不再查
+  `dpd_iface`、不再重跑 AUTO 决策。
+* 多 WAN 命中不再逐包校验 `dpd_wans`（那不是热路径该做的事，见下）。
+
+#### 2.6.2 代际号（`dpd_cfg.epoch`）与事件驱动失效
+
+「流空闲超时没过」并不等于「缓存里的出口/邻居还有效」。ABI 9 给每条流记录
+**学习时的代际号**（存在 `dpd_flow_val.wan` 的高字节），命中时只比一个字节；
+不一致就当作 miss，回慢路径重新学习。
+
+谁推进代际号（`dpdctl bump`）：
+
+| 事件 | 调用点 |
+|---|---|
+| 接口 up/down/地址变化（含 PPPoE 重拨） | `/etc/hotplug.d/iface/90-dpd-fastpath` |
+| 多 WAN 表被重写（增删 WAN、权重/健康变化） | `mydist-mwan` 写完 `dpd_wans` 之后 |
+| 运维手动 | `dpdctl bump` |
+
+代价是「一次全家失效」：代际号一变，所有流各多走 1–2 个慢包。相比逐包重校验
+（每包多两次 map 查询），这个交换在所有已测场景里都是赚的；真要定向失效，
+需要把路由/邻居事件映射到具体流，留作后续（评审 §3.2 的 P2）。
+
+#### 2.6.3 时间戳限频（`option flow_refresh_ms`，默认 250）
+
+命中路径只在距上次刷新超过 `flow_refresh_ms` 时写 `last_seen_ms`，省掉每包一次
+脏 cacheline 写。语义影响只有一个方向：**entry 最多比 `flow_ttl_ms` 多活
+`flow_refresh_ms`**（即"缓存得久一点"），绝不会让活跃流提前失效。设 0 恢复逐包刷新。
+
+#### 2.6.4 GSO/MTU：按"一个分段"的真实长度判断
+
+`skb->gso_size` 是**负载**长度，不含 IP/L4 头。ABI 8 直接拿它当分段长度，
+比真实分段短 28–60 字节，可能放行一个实际超过 MTU 的分段。ABI 9 按协议计算：
+
+```
+TCP: iph->ihl*4 + th->doff*4 + gso_size
+UDP: iph->ihl*4 + 8          + gso_size
+```
+
+分片、`:53`、DHCP、非单播、IPv6 这些门禁提前到 `bpf_fib_lookup()` **之前**：
+它们永远不可能被加速，就不该付一次路由查询。
+
+#### 2.6.5 已做的验证
+
+* CI `BPF-CHECK` 在 Ubuntu 上编译同一份源码（clang -target bpf），ABI 读出 9。
+* 实验机（x86_64，内核 6.18）`:  新对象通过 verifier（`tc filter add` 成功），
+  `bpftool map dump dpd_cfg` 显示新字段，`dpd_stats` 块结构与 20 个计数器对应。
+* 功能：172k 包命中、54 条流学习、`redirect_ok == flow_hit`；代际号 +1 后
+  同一批流被重新学习（`flow_write` 增长）再命中。
+* 吞吐 A/B：本实验机是共享 ESXi（1–2 vCPU，跨轮波动 ±40%），ABI 8 与 ABI 9 的
+  差值落在噪声里，**不作为收益证据**；能确证的是上表的每包工作量减少。
+
 ## 3. 文件
 
 ```
