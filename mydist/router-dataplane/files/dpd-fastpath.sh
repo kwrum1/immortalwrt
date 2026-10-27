@@ -330,6 +330,7 @@ dpd_uplink_devs() {
 	[ "$(uci -q get mydist_mwan.global.enabled 2>/dev/null)" = "1" ] || return 0
 	for w in $(uci -q show mydist_mwan 2>/dev/null |
 		sed -n 's/^mydist_mwan\.\([^.=]*\)\.interface=.*/\1/p'); do
+		[ "$(uci -q get "mydist_mwan.$w.enabled" 2>/dev/null)" = "0" ] && continue
 		d="$(dpd_resolve_logical "$w")"
 		[ -n "$d" ] && echo "$d"
 	done
