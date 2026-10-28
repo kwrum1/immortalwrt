@@ -91,6 +91,28 @@ if [ -n "$TARGET" ]; then
 		fi
 	done
 	"$CTL" set mode stateful >/dev/null 2>&1
+
+	# And the honest baseline: with no filter at all, forwarding must be
+	# identical. If "detached" behaves differently from observe/off, the
+	# difference is in the attach path, not in the accelerator.
+	if tc filter del dev "$DEV" ingress pref 100 2>/dev/null; then
+		sleep 1
+		if ping -c 2 -W 2 "$TARGET" >/dev/null 2>&1; then
+			ok "detached forwards"
+		else
+			bad "detached does not forward"
+		fi
+		/etc/init.d/dpd-fastpath start >/dev/null 2>&1 || 			tc filter add dev "$DEV" ingress pref 100 handle 100 \
+				bpf da obj /lib/bpf/dpd_fastpath.bpf.o sec classifier >/dev/null 2>&1
+		sleep 1
+		if [ -n "$("$CTL" stats 2>/dev/null | awk '/pkt_total/{print $3}')" ]; then
+			ok "re-attached after detach"
+		else
+			bad "re-attach failed"
+		fi
+	else
+		note "detached" "skipped (no filter on $DEV)"
+	fi
 else
 	note "modes" "skipped (no --target)"
 fi
