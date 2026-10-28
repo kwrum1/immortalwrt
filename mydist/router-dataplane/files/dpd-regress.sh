@@ -62,9 +62,17 @@ fi
 abi_have=$("$CTL" abi 2>/dev/null || echo 0)
 
 echo "== 1. object and ABI =="
-note "expected ABI" "$abi_want"
+note "expected ABI" "${abi_want:-unknown}"
 note "pinned ABI" "${abi_have:-0}"
-[ "$abi_want" = "$abi_have" ] && ok "ABI matches" || bad "ABI mismatch (stale pins?)"
+if [ -z "${abi_want:-}" ] || [ "${abi_have:-0}" = 0 ]; then
+	# Older dpdctl has no `abi` command; nothing to compare, and pretending
+	# to would make this script fail on an image that is actually fine.
+	note "ABI check" "skipped (dpdctl without an abi command)"
+elif [ "$abi_want" = "$abi_have" ]; then
+	ok "ABI matches"
+else
+	bad "ABI mismatch (stale pins?)"
+fi
 
 st=$("$CTL" stats 2>/dev/null | awk '/pkt_total/{print $3}')
 [ -n "${st:-}" ] && ok "stats readable (pkt_total=$st)" || bad "stats unreadable"

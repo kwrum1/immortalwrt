@@ -349,6 +349,36 @@ UDP: iph->ihl*4 + 8          + gso_size
   同一批流被重新学习（`flow_write` 增长）再命中。
 * 吞吐 A/B：本实验机是共享 ESXi（1–2 vCPU，跨轮波动 ±40%），ABI 8 与 ABI 9 的
   差值落在噪声里，**不作为收益证据**；能确证的是上表的每包工作量减少。
+* `/usr/libexec/dpd-regress.sh`（随包安装）：ABI 对齐、observe/off 仍转发、
+  门禁计数、epoch 失效、MTU 1500/1492/1400 矩阵、钩子清单。实验机上一次跑通
+  （`RESULT: pass`，ABI 8 上跳过 bump/abi 两项，ABI 9 镜像会全跑）。
+
+#### 2.6.6 多 WAN、mark 与策略路由的边界（评审 §3.4）
+
+* 流键包含 `ingress ifindex + family + proto + saddr + daddr + sport + dport`，即
+  "同一源/目的" 在内核里必然命中同一条 `ip rule`，所以缓存出口与首包一致。
+* 我们只写 `fwmark` 规则和每 WAN 的路由表（`mydist-mwan`），不改别的策略。
+  如果运维另加了基于源地址/接口的 `ip rule`，而那条规则在第一包之后才变化，
+  缓存会短暂落后——`ifupdate`/`ifdown` 都会 bump 代际号，把这类情况收敛到
+  "最多错一个事件周期"。
+* 多 WAN 表每次重写后 `dpdctl bump`：旧表里选中的 WAN index 和 MAC 对不会再被
+  用来发包（宁可多两个慢包，也不把包发到错的口）。
+
+#### 2.6.7 流表布局（评审 §4.5，暂无动作）
+
+`dpd_flow_val` 保持 24 字节、`dpd_flow_key` 保持 48 字节：两者都是 pinned-map
+ABI 的一部分，改大小会让升级后的 `tc filter add` 直接失败。ABI 9 已经用"高字节
+放代际号"把新信息塞进现有布局；继续压缩（例如 v4 用 32 字节键）要等 §10 的
+高并发流表测试给出 hit/miss 与内存曲线，先不做。
+
+#### 2.6.8 相关但不是数据面的两个旋钮
+
+* `router-tuning` 新增 `option mode 'throughput|balanced|latency'`：只影响
+  coalescing 与 `txqueuelen` 的取向（ring 保持驱动最大值），默认 `balanced`；
+  `router-tuning report` 会打印它实际会写什么。
+* `router-qos` 新增 `option profile 'auto|throughput|latency'`：`auto` 仍是按链路
+  速率选 cake/fq_codel；`latency` 固定 cake 并用 `rtt 10ms` 缩短 AQM 目标，
+  `throughput` 固定 fq_codel。默认路径没变。
 
 ## 3. 文件
 
