@@ -426,16 +426,33 @@ rt_iface_coalesce() {
 		return 0
 		;;
 	esac
-	local want=16
 	printf '%s' "$cur" | grep -qE 'rx-usecs' || {
 		rt_note "$dev coalesce" - 'skipped (no rx-usecs)'
 		return 0
 	}
-	rt_cmd "$dev coalesce" ethtool -C "$dev" rx-usecs "$want"
+	# Mode decides the trade-off (see router_tuning.config). tx-usecs is set
+	# too when the driver exposes it; a NIC that only knows rx-usecs simply
+	# gets the rx half.
+	local want
+	case "$RT_MODE" in
+	throughput)	want=32 ;;
+	latency)	want=0 ;;
+	*)		want=16 ;;
+	esac
+	if printf '%s' "$cur" | grep -qE 'tx-usecs'; then
+		rt_cmd "$dev coalesce" ethtool -C "$dev" rx-usecs "$want" tx-usecs "$want"
+	else
+		rt_cmd "$dev coalesce" ethtool -C "$dev" rx-usecs "$want"
+	fi
 }
 
 rt_iface_txqlen() {
-	local dev="$1" cur want=5000
+	local dev="$1" cur want
+	case "$RT_MODE" in
+	throughput)	want=5000 ;;
+	latency)	want=500 ;;
+	*)		want=2000 ;;
+	esac
 	cur=$(ip -o link show dev "$dev" 2>/dev/null | sed -n 's/.*qlen \([0-9]*\).*/\1/p' | head -1)
 	rt_int "$cur" || return 0
 	[ "$cur" -ge "$want" ] && { rt_note "$dev txqueuelen" "$cur" already; return 0; }
@@ -593,6 +610,11 @@ rt_config() {
 	config_get_bool RT_RPS_FALLBACK global rps_fallback 1
 	config_get_bool RT_GOVERNOR global governor 1
 	config_get RT_LIST global interfaces ''
+	config_get RT_MODE global mode balanced
+	case "$RT_MODE" in
+	throughput|balanced|latency) ;;
+	*) RT_MODE=balanced ;;
+	esac
 	RT_TIER=$(rt_tier "$RT_PROFILE")
 	rt_tier_values
 	if [ -n "$RT_LIST" ]; then

@@ -268,6 +268,16 @@ dpd_gate_mode() {
 		1) why="${why:-einat is not attached, so the reply of an accelerated flow would be dropped by fw4 (no conntrack state, no NAT)}" ;;
 		2) why="${why:-cannot tell whether einat is attached (no bpftool); refusing to accelerate blind}" ;;
 		esac
+		# and it must be on the uplink we actually steer into, not just
+		# somewhere on the box
+		if [ -z "$why" ]; then
+			dpd_einat_on_uplink
+			r=$?
+			case "$r" in
+			1) why="einat is not attached on at least one uplink, so flows steered there would have untracked replies" ;;
+			2) why="cannot confirm einat on the uplinks (no bpftool or no uplink device)" ;;
+			esac
+		fi
 		if [ -z "$why" ] && dpd_honk_owns && ! dpd_honk_passes_direct; then
 			why="honk owns the LAN TCX and its direct exit is terminal (unpatched core), so the classic chain never runs -- the proxy is the datapath, and claiming a fastpath the counters cannot back would be a lie"
 		fi
@@ -481,6 +491,30 @@ dpd_einat_attached() {
 	command -v bpftool >/dev/null 2>&1 || return 2
 	bpftool net show 2>/dev/null \
 		| grep -qE 'tcx/(ingress|egress)[[:space:]]+(ingress_rev_snat|egress_snat)'
+}
+
+# Is einat's NAT attached on the uplink device(s) the accelerated flows leave
+# through? dpd_einat_attached() answers "is some einat program attached
+# anywhere"; this answers "on the device that matters". A box with einat on a
+# second WAN but not on the one dpd steers into would accept the fast path
+# locally and then have its replies dropped on the way back.
+#
+# 0 = einat present on every uplink, 1 = missing on at least one,
+# 2 = cannot tell (no bpftool / no uplinks).
+dpd_einat_on_uplink() {
+	local d n=0
+
+	command -v bpftool >/dev/null 2>&1 || return 2
+	for d in $(dpd_uplink_devs); do
+		[ -n "$d" ] || continue
+		n=$((n + 1))
+		if ! bpftool net show 2>/dev/null | grep -E "^${d}\(" | grep -q 'ingress_rev_snat'; then
+			dpd_log "gate: uplink $d has no einat ingress_rev_snat"
+			return 1
+		fi
+	done
+	[ "$n" -gt 0 ] || return 2
+	return 0
 }
 
 # Do honk's TCX programs own the datapath on the devices this program hooks?

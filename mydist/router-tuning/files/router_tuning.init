@@ -27,7 +27,7 @@ start_service() {
 		rt_log 'disabled by /etc/config/router_tuning'
 		return 0
 	fi
-	rt_log "apply tier=$RT_TIER profile=$RT_PROFILE ifaces='$RT_IFACES'"
+	rt_log "apply tier=$RT_TIER profile=$RT_PROFILE mode=$RT_MODE ifaces='$RT_IFACES'"
 	rt_gen_sysctl "$RT_TIER"
 	rt_apply_all
 	rt_log 'apply done'
@@ -49,7 +49,7 @@ report() {
 	rt_config
 	RT_DRYRUN=1
 	echo "router-tuning report"
-	echo "  tier=$RT_TIER profile=$RT_PROFILE ram=$(rt_mem_mb)MB cpus=$(rt_ncpu) guest=$(rt_is_virt && echo yes || echo no)"
+	echo "  tier=$RT_TIER profile=$RT_PROFILE mode=$RT_MODE ram=$(rt_mem_mb)MB cpus=$(rt_ncpu) guest=$(rt_is_virt && echo yes || echo no)"
 	if [ "$RT_ENABLED" != 1 ]; then
 		rt_note enabled 0 'service is disabled'
 		return 0

@@ -31,6 +31,7 @@ rq_load() {
 	config_load router_qos
 	config_get_bool RQ_ENABLED global enabled 1
 	config_get RQ_WAN global wan wan
+	config_get RQ_PROFILE global profile auto
 
 	# Multi-WAN uplinks ride along automatically, so load balancing never
 	# leaves one link unqueued.

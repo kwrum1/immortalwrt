@@ -118,6 +118,7 @@ define Package/dpd-fastpath/install
 	$(INSTALL_DATA) ./files/dpd-fastpath.sh $(1)/usr/libexec/dpd-fastpath.sh
 	$(INSTALL_BIN) ./files/dpd-gate-refresh $(1)/usr/libexec/dpd-gate-refresh
 	$(INSTALL_BIN) ./files/dpd-gate-watchdog $(1)/usr/libexec/dpd-gate-watchdog
+	$(INSTALL_BIN) ./files/dpd-regress.sh $(1)/usr/libexec/dpd-regress.sh
 	$(INSTALL_DATA) ./files/dpd_fastpath.config $(1)/etc/config/dpd_fastpath
 	$(INSTALL_DATA) ./files/90-dpd-fastpath $(1)/etc/hotplug.d/iface/90-dpd-fastpath
 endef

@@ -122,6 +122,13 @@ rq_all_devs() {
 # tin; `diffserv4` keeps the four tins (Bulk / Best Effort / Video / Voice).
 # No `bandwidth`, so this is the unlimited scheduler: fairness and AQM only.
 rq_best_opts() {
+	# RQ_PROFILE=latency asks CAKE for a shorter target queue than its
+	# "internet" default (100ms); 10ms keeps a saturating upload from adding
+	# a noticeable RTT floor without turning the link into a drop test.
+	if [ "${RQ_PROFILE:-auto}" = "latency" ]; then
+		printf '%s' 'diffserv4 nat rtt 10ms'
+		return 0
+	fi
 	printf '%s' 'diffserv4 nat'
 }
 
@@ -150,6 +157,11 @@ rq_link_speed() {
 
 rq_pick_qdisc() {
 	local sp
+
+	case "${RQ_PROFILE:-auto}" in
+	throughput)	printf 'fq_codel'; return 0 ;;
+	latency)	printf 'cake'; return 0 ;;
+	esac
 
 	sp="$(rq_link_speed "$1")"
 	if [ "$sp" -eq 0 ] || [ "$sp" -le "$RQ_CAKE_MAX_SPEED" ]; then

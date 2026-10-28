@@ -37,13 +37,19 @@ case "$iv" in
 	0) iv=20 ;;
 esac
 
-dpd_log "watchdog: watching proxy ownership every ${iv}s"
-own_before=""
+dpd_log "watchdog: watching proxy/NAT/uplink state every ${iv}s"
+sig_before=""
 while :; do
 	sleep "$iv"
+
 	if dpd_honk_owns; then own=1; else own=0; fi
-	[ "$own" = "$own_before" ] && continue
-	own_before="$own"
+	if dpd_einat_attached; then ein=1; else ein=0; fi
+	if dpd_einat_on_uplink; then eup=1; else eup=0; fi
+	if dpd_has_uplink; then upl=1; else upl=0; fi
+	sig="$own$ein$eup$upl"
+
+	[ "$sig" = "$sig_before" ] && continue
+	sig_before="$sig"
 	emode="$(dpd_gate_refresh_uci)"
-	dpd_log "watchdog: proxy ownership changed (honk=$own); gate re-evaluated -> $emode"
+	dpd_log "watchdog: state changed (honk=$own einat=$ein einat_on_uplink=$eup uplink=$upl); gate re-evaluated -> $emode"
 done
