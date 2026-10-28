@@ -380,6 +380,32 @@ ABI 的一部分，改大小会让升级后的 `tc filter add` 直接失败。AB
   速率选 cake/fq_codel；`latency` 固定 cake 并用 `rtt 10ms` 缩短 AQM 目标，
   `throughput` 固定 fq_codel。默认路径没变。
 
+#### 2.6.9 IPv6（ABI 10，默认关闭）
+
+代码已实现，`option ipv6 '1'` 才启用：
+
+* 只接管 **TCP/UDP**；扩展头（hop-by-hop/routing/dest-opts/fragment）、分片、
+  组播（ff00::/8）、端口 53、DHCPv6（546/547）、hop_limit<=1 一律拒绝。
+* 没有 NAT66：回程靠 conntrack + 状态化 priming（首包走栈），不依赖 einat。
+* 多 WAN 选路只对 IPv4 生效；v6 走 FIB 选出的那条路由。
+* 新增计数 `ST_V6_OK`（`dpdctl stats | grep v6_ok`）。
+
+**实测（2026-10-28，x86 实验台，合成 2001:db8 网段）**：
+
+| 步骤 | 结果 |
+|---|---|
+| honk 停止，dpd `ipv6=0` | v6 TCP 2.2 Gbit/s，正常 |
+| honk 停止，dpd `ipv6=1` | 前 8 个包进快路径（`v6_ok`=8），随后 TCP 会话断开 |
+| honk 运行（默认配置） | **v6 TCP 直接失败**（SYN-ACK 回不来） |
+
+两个结论：
+
+1. dpd 的 v6 接管能落地（verifier 通过、计数增长），但出口学习/回程还有一处
+   未解决的错误（流表里出现 `ingress=eth2 egress=eth2`），所以**默认关闭**。
+2. 更基础的问题不在 dpd：**honk 在跑的时候 v6 转发本身就是坏的**（停掉 honk 就
+   恢复）。所以这个固件的 v6 支持需要单独一轮：先让 honk 对 v6 做 `direct`，
+   再修 dpd 的 v6 出口，两者都验证过才谈默认开启。
+
 ## 3. 文件
 
 ```
